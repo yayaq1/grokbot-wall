@@ -26,9 +26,47 @@ if (CODES_FILE.includes('example')) console.warn('  ! data/codes.json not found 
 const CODES = JSON.parse(fs.readFileSync(path.join(ROOT, CODES_FILE), 'utf8'));
 const STATE_FILE = path.join(ROOT, 'data/state.json');
 
+// ---- state store: Supabase when configured, the JSON file otherwise ----
+// The file is still written either way, as a local cache and as the input to /backup.
+const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const SB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const SB_ROW = process.env.SUPABASE_ROW_ID || 'default';
+const sbOn = Boolean(SB_URL && SB_KEY);
+const sbHeaders = { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}`, 'content-type': 'application/json' };
+async function sbLoad() {
+  const r = await fetch(`${SB_URL}/rest/v1/wall_state?id=eq.${encodeURIComponent(SB_ROW)}&select=data`, { headers: sbHeaders });
+  if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 200)}`);
+  const rows = await r.json(); return rows[0] ? rows[0].data : null;
+}
+async function sbSave(snapshot) {
+  const r = await fetch(`${SB_URL}/rest/v1/wall_state?on_conflict=id`, {
+    method: 'POST', headers: { ...sbHeaders, prefer: 'resolution=merge-duplicates' },
+    body: JSON.stringify({ id: SB_ROW, data: snapshot, updated_at: new Date().toISOString() }),
+  });
+  if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 200)}`);
+}
+
 let state = { allocations: [], config: { eventId: process.env.LUMA_EVENT_ID || null, poolMode: 'A-then-B', pollMs: 5000 } };
-try { const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); state = { ...state, ...s, config: { ...state.config, ...(s.config || {}) } }; } catch {}
-const save = () => fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+const merge = s => { state = { ...state, ...s, config: { ...state.config, ...(s.config || {}) } }; };
+if (sbOn) {
+  // Fail fast rather than start from a stale file: running on the wrong allocation list hands
+  // guests codes that were already given away. Render restarts us, so a blip self-heals.
+  let remote;
+  try { remote = await sbLoad(); }
+  catch (e) { console.error(`\n  ✗ supabase unreachable: ${e.message}\n    refusing to start on possibly stale state — fix SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY\n`); process.exit(1); }
+  if (remote) { merge(remote); console.log(`  ◇ state from supabase (${(remote.allocations || []).length} allocations)`); }
+  else console.log('  ◇ supabase reachable, no state row yet — starting fresh');
+} else {
+  try { merge(JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))); } catch {}
+}
+
+let sbChain = Promise.resolve();
+const save = () => {
+  try { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); } catch (e) { console.error(`  ✗ state file write failed: ${e.message}`); }
+  if (!sbOn) return;
+  const snapshot = structuredClone(state);   // state keeps mutating while the request is in flight
+  sbChain = sbChain.then(() => sbSave(snapshot)).catch(e => console.error(`  ✗ supabase save failed: ${e.message}`));
+};
 // backfill code indexes on allocations made before `n` existed
 for (const a of state.allocations) for (const c of a.codes || []) if (!c.n) { const i = (CODES[c.pool] || []).findIndex(x => x.code === c.code); if (i >= 0) c.n = i + 1; }
 
@@ -416,6 +454,6 @@ server.listen(PORT, () => {
   console.log(`    codes   A=${CODES.A.length}  B=${CODES.B.length}   allocated so far: ${state.allocations.length}`);
   const ei = emailInfo();
   console.log(`    email   ${!ei.enabled ? 'OFF (set SMTP_USER/SMTP_PASS in .env)' : ei.dryRun ? 'DRY RUN (logs only)' : ei.host + ' · from ' + ei.from + (ei.testTo ? ' · ALL mail redirected to ' + ei.testTo : '')}`);
-  console.log(`    state   ${path.relative(process.cwd(), STATE_FILE)}\n`);
+  console.log(`    state   ${sbOn ? 'supabase · row ' + SB_ROW : path.relative(process.cwd(), STATE_FILE)}\n`);
   if (KEY) { schedulePoll(300); registerWebhook(); }
 });

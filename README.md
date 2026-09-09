@@ -67,6 +67,28 @@ Open the wall with `&desk` in the URL and press `D`: search guests, see a guest'
 QR, resend their email, release a code back to the pool, do a manual check-in for walk-ins,
 export a CSV, change settings (event, pool mode, poll interval).
 
+## State storage
+
+By default the server keeps allocations in `data/state.json`. Set `SUPABASE_URL` and
+`SUPABASE_SERVICE_ROLE_KEY` and it keeps them in Postgres instead, which is what makes a host
+with no persistent disk safe - the wall reloads its allocations after any restart or sleep.
+The JSON file is still written as a local cache and feeds `/backup`.
+
+Create the table once, in the Supabase SQL editor:
+
+```sql
+create table if not exists wall_state (
+  id text primary key,
+  data jsonb not null,
+  updated_at timestamptz not null default now()
+);
+alter table wall_state enable row level security;
+```
+
+No RLS policies are needed: the service role key bypasses RLS, and without a policy the anon key
+can read nothing. If Supabase is configured but unreachable at boot the server exits rather than
+start from a stale file, since that would re-issue codes guests already have.
+
 ## How the email queue behaves
 
 Sends are queued at 2/s with a timeout on each request, retries on rate limits and
