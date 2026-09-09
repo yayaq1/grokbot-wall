@@ -1,6 +1,8 @@
 FROM node:22-alpine
 WORKDIR /app
-COPY package.json build.mjs serve.mjs hook-relay.mjs tunnel.mjs ./
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY build.mjs serve.mjs hook-relay.mjs tunnel.mjs ./
 COPY src ./src
 COPY assets ./assets
 COPY data/codes.example.json ./data/codes.example.json

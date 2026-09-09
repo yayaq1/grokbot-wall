@@ -4,7 +4,7 @@
 #   ./deploy.sh tunnel     # also start the cloudflared named tunnel (needs TUNNEL_TOKEN in .env)
 set -euo pipefail
 cd "$(dirname "$0")"
-[ -f .env ] || { echo "missing .env — copy .env.example and fill in LUMA_API_KEY, RESEND_API_KEY, EMAIL_FROM, WALL_TOKEN, PUBLIC_URL"; exit 1; }
+[ -f .env ] || { echo "missing .env — copy .env.example and fill in LUMA_API_KEY, SMTP_USER, SMTP_PASS, EMAIL_FROM, WALL_TOKEN, PUBLIC_URL"; exit 1; }
 grep -q '^WALL_TOKEN=.\+' .env || { echo "WALL_TOKEN is empty in .env — refusing to expose an open server"; exit 1; }
 mkdir -p data
 if [ "${1:-}" = "tunnel" ]; then docker compose --profile tunnel up -d --build; else docker compose up -d --build; fi
