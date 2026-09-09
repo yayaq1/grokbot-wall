@@ -10,7 +10,7 @@ drifting headline and colour field on a finer grid behind it; a live check-in fe
 block-letter welcome as overlays. Click or tap the art for an ASCII shockwave.
 
 The server does the work: it polls Luma (and accepts its webhook), allocates one code per
-guest, and emails it via Resend. The wall page is a viewer. A hidden staff console handles
+guest, and emails it over SMTP. The wall page is a viewer. A hidden staff console handles
 lookups, resends, manual check-ins, and a CSV export.
 
 ## Quick start (local, demo mode)
@@ -27,7 +27,9 @@ to fake a check-in, `F` for fullscreen.
 1. `cp .env.example .env` and fill in:
    - `EVENT_NAME` — the headline on the wall and the name in the email.
    - `LUMA_API_KEY` (Luma → Settings → Developer → API Keys) and `LUMA_EVENT_ID` (`evt-…`).
-   - `RESEND_API_KEY` and `EMAIL_FROM` (the sender domain must be verified in Resend).
+   - `SMTP_USER` and `SMTP_PASS` (Google Workspace: 2-Step Verification, then an App Password
+     from https://myaccount.google.com/apppasswords). `EMAIL_FROM` must be that address or a
+     "Send mail as" alias. Workspace sends up to 2000/day, free Gmail 500/day.
    - `WALL_TOKEN` — any secret; the wall is opened as `/?key=<token>`.
    - `PUBLIC_URL` — the public https URL once hosted (used for the email hero image and to
      self-register the Luma webhook).
@@ -88,7 +90,7 @@ bot form and colour · `?raw` 3D scene without the ASCII pass.
 
 ```
 src/index.html      the wall (three.js UMD + qrcode-generator are inlined by the build)
-serve.mjs           server: static, Luma proxy + polling, allocation, Resend queue, webhook
+serve.mjs           server: static, Luma proxy + polling, allocation, SMTP queue, webhook
 build.mjs           → dist/index.html  (--no-codes for a public copy)
 tunnel.mjs          laptop mode: cloudflared quick tunnel + webhook lifecycle
 hook-relay.mjs      exposes only the webhook path for that tunnel

@@ -952,7 +952,7 @@ function mailBadge(a) {
 }
 function mailLine(a) {
   const m = a.mail;
-  if (!app.email || !app.email.enabled) return 'delivery is off — set RESEND_API_KEY in .env and restart serve.mjs';
+  if (!app.email || !app.email.enabled) return 'delivery is off — set SMTP_USER/SMTP_PASS in .env and restart serve.mjs';
   if (!m) return 'not sent yet';
   if (m.status === 'sent') return `sent ${fmtHM(m.at)} to ${m.to}`;
   if (m.status === 'dry') return `dry run ${fmtHM(m.at)} → ${m.to}`;
@@ -1036,7 +1036,7 @@ async function settingsModal() {
   openModal(`<h3>Settings</h3><form id="sf">
     ${app.luma ? `<div class="field"><label>luma event</label><select name="eventId"><option value="">auto (nearest upcoming)</option>${evOpts}</select></div>` : `<div class="field"><label>luma</label><div class="dk-empty">no API key on the server → demo/manual mode. Put LUMA_API_KEY in .env and restart serve.mjs.</div></div>`}
     <div class="field"><label>credit pools</label><select name="poolMode"><option value="A-then-B"${app.config.poolMode === 'A-then-B' ? ' selected' : ''}>one code per guest · pool A first, then B</option><option value="B-then-A"${app.config.poolMode === 'B-then-A' ? ' selected' : ''}>one code per guest · pool B first, then A</option><option value="both"${app.config.poolMode === 'both' ? ' selected' : ''}>two codes per guest · one from each pool</option></select></div>
-    <div class="field"><label>email delivery</label><div class="dk-empty">${!app.server ? 'needs serve.mjs' : !app.email || !app.email.enabled ? 'off — set RESEND_API_KEY (and EMAIL_FROM) in .env, then restart serve.mjs' : `Resend · from ${esc(app.email.from)}${app.email.dryRun ? ' · DRY RUN (nothing is sent)' : ''}${app.email.testTo ? ` · every guest email is redirected to ${esc(app.email.testTo)}` : ''}`}</div></div>
+    <div class="field"><label>email delivery</label><div class="dk-empty">${!app.server ? 'needs serve.mjs' : !app.email || !app.email.enabled ? 'off — set SMTP_USER/SMTP_PASS (and EMAIL_FROM) in .env, then restart serve.mjs' : `${esc(app.email.host || 'smtp')} · from ${esc(app.email.from)}${app.email.dryRun ? ' · DRY RUN (nothing is sent)' : ''}${app.email.testTo ? ` · every guest email is redirected to ${esc(app.email.testTo)}` : ''}`}</div></div>
     ${app.server && app.email && app.email.enabled ? `<div class="field"><label>send a test email (fake code) to</label><div class="row" style="margin:0"><input id="sf-testto" type="email" placeholder="you@example.com" style="flex:1" autocomplete="off"><button type="button" id="sf-test">send test</button></div></div>` : ''}
     <div class="field"><label>poll interval (seconds)</label><input name="poll" type="number" min="2" max="60" value="${Math.round(app.config.pollMs / 1000)}"></div>
     <div class="field"><label>cell height px (text size, reloads)</label><input name="cell" type="number" min="12" max="40" value="${G.ch}"></div>

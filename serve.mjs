@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
+import nodemailer from 'nodemailer';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
@@ -31,9 +32,12 @@ const save = () => fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 // backfill code indexes on allocations made before `n` existed
 for (const a of state.allocations) for (const c of a.codes || []) if (!c.n) { const i = (CODES[c.pool] || []).findIndex(x => x.code === c.code); if (i >= 0) c.n = i + 1; }
 
-// ---- email (Resend) ----
-const RESEND_KEY = process.env.RESEND_API_KEY || '';
-const EMAIL_FROM = process.env.EMAIL_FROM || 'Grok Bot <onboarding@resend.dev>';
+// ---- email (SMTP) ----
+const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
+const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
+const SMTP_USER = process.env.SMTP_USER || '';
+const SMTP_PASS = (process.env.SMTP_PASS || '').replace(/\s+/g, '');   // Google prints app passwords in 4-char groups
+const EMAIL_FROM = process.env.EMAIL_FROM || SMTP_USER;
 const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || '';
 const EMAIL_SUBJECT = process.env.EMAIL_SUBJECT || `Your Cursor credits from ${process.env.EVENT_NAME || 'Grok Bot Meetup'}`;
 const EVENT_NAME = process.env.EVENT_NAME || '';
@@ -41,13 +45,19 @@ const EMAIL_EVENT = process.env.EMAIL_EVENT_NAME || EVENT_NAME || 'Grok Bot Meet
 const EMAIL_DRY_RUN = /^(1|true|yes)$/i.test(process.env.EMAIL_DRY_RUN || '');
 const EMAIL_TEST_TO = process.env.EMAIL_TEST_TO || '';           // if set, every guest email is redirected here
 const EMAIL_OFF = /^(1|true|yes)$/i.test(process.env.EMAIL_OFF || '');
-const emailEnabled = () => !EMAIL_OFF && (EMAIL_DRY_RUN || Boolean(RESEND_KEY));
-const emailInfo = () => ({ enabled: emailEnabled(), dryRun: EMAIL_DRY_RUN, from: EMAIL_FROM, testTo: EMAIL_TEST_TO, hasKey: Boolean(RESEND_KEY) });
+const emailEnabled = () => !EMAIL_OFF && (EMAIL_DRY_RUN || Boolean(SMTP_USER && SMTP_PASS));
+const emailInfo = () => ({ enabled: emailEnabled(), dryRun: EMAIL_DRY_RUN, from: EMAIL_FROM, testTo: EMAIL_TEST_TO, host: SMTP_HOST, user: SMTP_USER, hasKey: Boolean(SMTP_USER && SMTP_PASS) });
 const isEmail = e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(e || ''));
 const escHtml = t => String(t ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-// timeout covers connect + headers + body (a stalled body read is what wedged the queue on event day)
-async function fetchJsonWithTimeout(url, init, ms = 20000) { const ac = new AbortController(); const t = setTimeout(() => ac.abort(), ms); try { const r = await fetch(url, { ...init, signal: ac.signal }); const body = await r.json().catch(() => ({})); return { status: r.status, ok: r.ok, body }; } finally { clearTimeout(t); } }
+// one pooled connection, reused across the queue. Timeouts matter: a stalled socket is what wedged the queue on event day.
+let mailer = null;
+const transport = () => (mailer ||= nodemailer.createTransport({
+  host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_PORT === 465,
+  auth: { user: SMTP_USER, pass: SMTP_PASS },
+  pool: true, maxConnections: 1,   // pumpMail sends one at a time anyway
+  connectionTimeout: 20000, greetingTimeout: 20000, socketTimeout: 30000,
+}));
 
 function renderEmail(a) {
   const first = String(a.name || '').trim().split(/\s+/)[0] || 'there';
@@ -147,18 +157,18 @@ async function deliver(a, { to, tag = '' } = {}) {
   if (EMAIL_DRY_RUN) { console.log(`  ✉ dry-run → ${dest}  (${a.name || a.key})`); return { status: 'dry', to: dest, at, subject }; }
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
-      const r = await fetchJsonWithTimeout('https://api.resend.com/emails', {
-        method: 'POST', headers: { authorization: `Bearer ${RESEND_KEY}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ from: EMAIL_FROM, to: [dest], reply_to: EMAIL_REPLY_TO || undefined, subject, html: msg.html, text: msg.text }),
-      });
-      const body = r.body;
-      if (r.status === 429) { await sleep(1500 * (attempt + 1)); continue; }
-      if (!r.ok) return { status: 'failed', to: dest, at, error: `${r.status} ${body.message || body.name || ''}`.trim() };
-      console.log(`  ✉ sent → ${dest}  (${a.name || a.key})  ${body.id || ''}`);
-      return { status: 'sent', to: dest, at, id: body.id || null };
-    } catch (e) { if (attempt === 3) return { status: 'failed', to: dest, at, error: String(e.message || e) }; await sleep(1000); }
+      const info = await transport().sendMail({ from: EMAIL_FROM, to: dest, replyTo: EMAIL_REPLY_TO || undefined, subject, html: msg.html, text: msg.text });
+      console.log(`  ✉ sent → ${dest}  (${a.name || a.key})  ${info.messageId || ''}`);
+      return { status: 'sent', to: dest, at, id: info.messageId || null };
+    } catch (e) {
+      const code = e.responseCode || 0;
+      const err = `${code || e.code || ''} ${e.message || e}`.trim();
+      // 5xx is a permanent refusal (bad address, auth rejected, over quota) — retrying just burns the queue
+      if (code >= 500) return { status: 'failed', to: dest, at, error: err };
+      if (attempt === 3) return { status: 'failed', to: dest, at, error: `${err} (gave up)` };
+      await sleep(1500 * (attempt + 1));
+    }
   }
-  return { status: 'failed', to: dest, at, error: '429 rate limited (gave up)' };
 }
 
 // ---- access token: everything except the Luma webhook needs it when WALL_TOKEN is set ----
@@ -264,7 +274,7 @@ async function pumpMail() {
       a.mail.tries = tries;
       save();
       if (a.mail.status === 'failed') console.log(`  ✉ FAILED → ${a.mail.to}: ${a.mail.error}`);
-      await sleep(600);  // Resend default limit is 2 req/s
+      await sleep(600);  // gentle pacing; Gmail throttles bursts
     }
   } finally { mailBusy = false; }
 }
@@ -274,7 +284,7 @@ function requeueStale(all = false) {   // all=true on startup: the in-memory que
   const now = Date.now(); let n = 0;
   for (const a of state.allocations) {
     const m = a.mail;
-    const transient = m && m.status === 'failed' && (m.tries || 0) < 3 && /timed out|abort|ECONN|fetch failed|network|rate limited/i.test(m.error || '') && now - new Date(m.at).getTime() > 60_000;
+    const transient = m && m.status === 'failed' && (m.tries || 0) < 3 && /timed out|abort|ECONN|ETIMEDOUT|network|rate limited|gave up/i.test(m.error || '') && now - new Date(m.at).getTime() > 60_000;
     if (!m || transient || (m.status === 'queued' && (all || now - new Date(m.at).getTime() > 30_000))) {
       if (!isEmail(a.email) || !a.codes.length || mailQueue.includes(a.key)) continue;
       a.mail = { status: 'queued', at: new Date().toISOString(), tries: (m && m.tries) || 0 }; mailQueue.push(a.key); n++;
@@ -353,7 +363,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/email/test' && req.method === 'POST') {
       const b = await readBody(req); const to = String(b.to || '').trim();
       if (!isEmail(to)) return json(res, 400, { message: 'valid "to" address required' });
-      if (!emailEnabled()) return json(res, 503, { message: 'email not configured (set RESEND_API_KEY, or EMAIL_DRY_RUN=1)' });
+      if (!emailEnabled()) return json(res, 503, { message: 'email not configured (set SMTP_USER/SMTP_PASS, or EMAIL_DRY_RUN=1)' });
       const sample = { key: 'test', name: b.name || 'Test Guest', email: to, codes: [{ pool: 'A', code: 'TEST-CODE-NOT-REAL', url: 'https://cursor.com/referral?code=TEST-CODE-NOT-REAL' }] };
       if (state.config.poolMode === 'both') sample.codes.push({ pool: 'B', code: 'POOLB-TEST-CODE', url: 'https://cursor.com/referral?code=POOLB-TEST-CODE' });
       const result = await deliver(sample, { to, tag: '[TEST] ' });
@@ -405,7 +415,7 @@ server.listen(PORT, () => {
   if (PUBLIC_URL) console.log(`    public  ${PUBLIC_URL}`);
   console.log(`    codes   A=${CODES.A.length}  B=${CODES.B.length}   allocated so far: ${state.allocations.length}`);
   const ei = emailInfo();
-  console.log(`    email   ${!ei.enabled ? 'OFF (set RESEND_API_KEY in .env)' : ei.dryRun ? 'DRY RUN (logs only)' : 'Resend · from ' + ei.from + (ei.testTo ? ' · ALL mail redirected to ' + ei.testTo : '')}`);
+  console.log(`    email   ${!ei.enabled ? 'OFF (set SMTP_USER/SMTP_PASS in .env)' : ei.dryRun ? 'DRY RUN (logs only)' : ei.host + ' · from ' + ei.from + (ei.testTo ? ' · ALL mail redirected to ' + ei.testTo : '')}`);
   console.log(`    state   ${path.relative(process.cwd(), STATE_FILE)}\n`);
   if (KEY) { schedulePoll(300); registerWebhook(); }
 });

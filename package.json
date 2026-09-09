@@ -7,5 +7,8 @@
     "start": "node build.mjs && node serve.mjs",
     "serve": "node serve.mjs",
     "tunnel": "node tunnel.mjs"
+  },
+  "dependencies": {
+    "nodemailer": "^10.0.1"
   }
 }
