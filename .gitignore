@@ -7,3 +7,4 @@ dist/
 cloudflared/*.json
 cloudflared/config.yml
 data/codes.json
+.idea/
