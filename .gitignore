@@ -8,3 +8,4 @@ cloudflared/*.json
 cloudflared/config.yml
 data/codes.json
 .idea/
+data/CODES_JSON.txt
