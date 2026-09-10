@@ -110,6 +110,19 @@ curl -X POST "$URL/release?key=$KEY" -H 'content-type: application/json' -d '{"k
 
 The last line returns the code to the pool, so a smoke test costs nothing.
 
+## Getting the codes to a host
+
+`data/codes.json` is gitignored and is not copied into the image, so a deployed container has
+only the placeholders. Paste the same JSON, minified, into a `CODES_JSON` env var and it is used
+instead of the file. The startup banner prints which source is in use:
+
+```
+codes   A=100  B=0  from CODES_JSON   allocated so far: 0
+```
+
+Malformed JSON, or JSON without `A` and `B` arrays, exits at boot rather than starting a wall
+that cannot hand out codes.
+
 ## State storage
 
 By default the server keeps allocations in `data/state.json`. Set `SUPABASE_URL` and

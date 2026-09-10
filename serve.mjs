@@ -21,9 +21,15 @@ try {
 const KEY = process.env.LUMA_API_KEY || '';
 const PORT = Number(process.env.PORT || 8787);
 const LUMA = 'https://public-api.luma.com';
+// data/codes.json is gitignored and never in the image, so a host with no writable disk carries
+// the real codes in CODES_JSON instead. Same JSON either way.
 const CODES_FILE = fs.existsSync(path.join(ROOT, 'data/codes.json')) ? 'data/codes.json' : 'data/codes.example.json';
-if (CODES_FILE.includes('example')) console.warn('  ! data/codes.json not found — using the placeholder codes from data/codes.example.json');
-const CODES = JSON.parse(fs.readFileSync(path.join(ROOT, CODES_FILE), 'utf8'));
+const CODES_SRC = process.env.CODES_JSON ? 'CODES_JSON' : CODES_FILE;
+if (!process.env.CODES_JSON && CODES_FILE.includes('example')) console.warn('  ! data/codes.json not found — using the placeholder codes from data/codes.example.json');
+let CODES;
+try { CODES = JSON.parse(process.env.CODES_JSON || fs.readFileSync(path.join(ROOT, CODES_FILE), 'utf8')); }
+catch (e) { console.error(`\n  ✗ could not parse codes from ${CODES_SRC}: ${e.message}\n`); process.exit(1); }
+if (!Array.isArray(CODES.A) || !Array.isArray(CODES.B)) { console.error(`\n  ✗ codes from ${CODES_SRC} need "A" and "B" arrays\n`); process.exit(1); }
 const STATE_FILE = path.join(ROOT, 'data/state.json');
 
 // ---- state store: Supabase when configured, the JSON file otherwise ----
@@ -481,7 +487,7 @@ server.listen(PORT, () => {
   console.log(`    luma    ${KEY ? `API key loaded · server polls every ${Math.round((state.config.pollMs || 5000) / 1000)}s` : 'NO API KEY → wall runs in demo mode (set LUMA_API_KEY in .env)'}`);
   console.log(`    auth    ${WALL_TOKEN ? 'token set → open /?key=' + WALL_TOKEN.slice(0, 4) + '…' : 'OPEN — set WALL_TOKEN before exposing this publicly'}`);
   if (PUBLIC_URL) console.log(`    public  ${PUBLIC_URL}`);
-  console.log(`    codes   A=${CODES.A.length}  B=${CODES.B.length}   allocated so far: ${state.allocations.length}`);
+  console.log(`    codes   A=${CODES.A.length}  B=${CODES.B.length}  from ${CODES_SRC}   allocated so far: ${state.allocations.length}`);
   const ei = emailInfo();
   console.log(`    email   ${!ei.enabled ? 'OFF (set SMTP_USER/SMTP_PASS in .env)' : ei.dryRun ? 'DRY RUN (logs only)' : ei.host + ' · from ' + ei.from + (ei.testTo ? ' · ALL mail redirected to ' + ei.testTo : '')}`);
   console.log(`    state   ${sbOn ? 'supabase · row ' + SB_ROW : path.relative(process.cwd(), STATE_FILE)}\n`);
