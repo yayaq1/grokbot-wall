@@ -67,6 +67,18 @@ Open the wall with `&desk` in the URL and press `D`: search guests, see a guest'
 QR, resend their email, release a code back to the pool, do a manual check-in for walk-ins,
 export a CSV, change settings (event, pool mode, poll interval).
 
+## Choosing an email transport
+
+Set `MAILGUN_API_KEY` and `MAILGUN_DOMAIN` and the wall sends over Mailgun's HTTP API;
+otherwise it sends over SMTP. Both go through the same queue, retries and dry-run switches.
+
+Use Mailgun when the host blocks outbound SMTP. Render does, on IPv4 (connections to port 465
+and 587 time out) and on IPv6 (no route from the container at all), so SMTP cannot work there.
+SMTP over a Gmail or Workspace app password is fine locally and on hosts that permit it.
+
+Mailgun's sandbox domain only delivers to Authorized Recipients you add by hand, so an event
+needs a verified domain under Sending -> Domains.
+
 ## Dev and live on one deployment
 
 The wall has no build-time modes: a dev deployment is the same image with different env vars.

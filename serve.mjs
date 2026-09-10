@@ -71,6 +71,10 @@ const save = () => {
 for (const a of state.allocations) for (const c of a.codes || []) if (!c.n) { const i = (CODES[c.pool] || []).findIndex(x => x.code === c.code); if (i >= 0) c.n = i + 1; }
 
 // ---- email (SMTP) ----
+const MG_KEY = process.env.MAILGUN_API_KEY || '';
+const MG_DOMAIN = process.env.MAILGUN_DOMAIN || '';
+const MG_BASE = (process.env.MAILGUN_BASE || 'https://api.mailgun.net').replace(/\/$/, '');   // api.eu.mailgun.net for EU accounts
+const MG_ON = Boolean(MG_KEY && MG_DOMAIN);   // preferred when set: PaaS hosts (Render) block outbound SMTP
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
 const SMTP_USER = process.env.SMTP_USER || '';
@@ -83,8 +87,8 @@ const EMAIL_EVENT = process.env.EMAIL_EVENT_NAME || EVENT_NAME || 'Grok Bot Meet
 const EMAIL_DRY_RUN = /^(1|true|yes)$/i.test(process.env.EMAIL_DRY_RUN || '');
 const EMAIL_TEST_TO = process.env.EMAIL_TEST_TO || '';           // if set, every guest email is redirected here
 const EMAIL_OFF = /^(1|true|yes)$/i.test(process.env.EMAIL_OFF || '');
-const emailEnabled = () => !EMAIL_OFF && (EMAIL_DRY_RUN || Boolean(SMTP_USER && SMTP_PASS));
-const emailInfo = () => ({ enabled: emailEnabled(), dryRun: EMAIL_DRY_RUN, from: EMAIL_FROM, testTo: EMAIL_TEST_TO, host: SMTP_HOST, user: SMTP_USER, hasKey: Boolean(SMTP_USER && SMTP_PASS) });
+const emailEnabled = () => !EMAIL_OFF && (EMAIL_DRY_RUN || MG_ON || Boolean(SMTP_USER && SMTP_PASS));
+const emailInfo = () => ({ enabled: emailEnabled(), dryRun: EMAIL_DRY_RUN, from: EMAIL_FROM, testTo: EMAIL_TEST_TO, host: MG_ON ? `mailgun · ${MG_DOMAIN}` : SMTP_HOST, user: MG_ON ? MG_DOMAIN : SMTP_USER, hasKey: Boolean(MG_ON || (SMTP_USER && SMTP_PASS)) });
 const isEmail = e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(e || ''));
 const escHtml = t => String(t ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -98,6 +102,28 @@ const transport = () => (mailer ||= nodemailer.createTransport({
 
   connectionTimeout: 20000, greetingTimeout: 20000, socketTimeout: 30000,
 }));
+
+// Mailgun's HTTP API. Reachable where SMTP is not, and the error classes are inverted from
+// SMTP: 4xx is the permanent one (bad key, unauthorised recipient), 5xx and 429 are worth a retry.
+async function sendMailgun({ from, to, replyTo, subject, html, text }) {
+  const form = new URLSearchParams({ from, to, subject, html, text });
+  if (replyTo) form.set('h:Reply-To', replyTo);
+  let r;
+  try {
+    r = await fetch(`${MG_BASE}/v3/${MG_DOMAIN}/messages`, {
+      method: 'POST',
+      headers: { authorization: 'Basic ' + Buffer.from(`api:${MG_KEY}`).toString('base64') },
+      body: form, signal: AbortSignal.timeout(20000),
+    });
+  } catch (e) { const err = new Error(`mailgun ${e.message}`); err.permanent = false; throw err; }   // network: retry
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const err = new Error(`${r.status} ${body.message || ''}`.trim());
+    err.permanent = r.status >= 400 && r.status < 500 && r.status !== 429;
+    throw err;
+  }
+  return body.id || null;
+}
 
 function renderEmail(a) {
   const first = String(a.name || '').trim().split(/\s+/)[0] || 'there';
@@ -197,14 +223,16 @@ async function deliver(a, { to, tag = '' } = {}) {
   if (EMAIL_DRY_RUN) { console.log(`  ✉ dry-run → ${dest}  (${a.name || a.key})`); return { status: 'dry', to: dest, at, subject }; }
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
-      const info = await transport().sendMail({ from: EMAIL_FROM, to: dest, replyTo: EMAIL_REPLY_TO || undefined, subject, html: msg.html, text: msg.text });
-      console.log(`  ✉ sent → ${dest}  (${a.name || a.key})  ${info.messageId || ''}`);
-      return { status: 'sent', to: dest, at, id: info.messageId || null };
+      const fields = { from: EMAIL_FROM, to: dest, replyTo: EMAIL_REPLY_TO || undefined, subject, html: msg.html, text: msg.text };
+      const id = MG_ON ? await sendMailgun(fields) : (await transport().sendMail(fields)).messageId || null;
+      console.log(`  ✉ sent → ${dest}  (${a.name || a.key})  ${id || ''}`);
+      return { status: 'sent', to: dest, at, id };
     } catch (e) {
       const code = e.responseCode || 0;
       const err = `${code || e.code || ''} ${e.message || e}`.trim();
-      // 5xx is a permanent refusal (bad address, auth rejected, over quota) — retrying just burns the queue
-      if (code >= 500) return { status: 'failed', to: dest, at, error: err };
+      // permanent means retrying cannot help: an SMTP 5xx refusal, or a Mailgun 4xx (bad key, unauthorised recipient)
+      const permanent = MG_ON ? e.permanent === true : code >= 500;
+      if (permanent) return { status: 'failed', to: dest, at, error: err };
       if (attempt === 3) return { status: 'failed', to: dest, at, error: `${err} (gave up)` };
       await sleep(1500 * (attempt + 1));
     }
