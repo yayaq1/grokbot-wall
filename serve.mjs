@@ -94,6 +94,8 @@ const transport = () => (mailer ||= nodemailer.createTransport({
   host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_PORT === 465,
   auth: { user: SMTP_USER, pass: SMTP_PASS },
   pool: true, maxConnections: 1,   // pumpMail sends one at a time anyway
+  family: 4,   // PaaS containers often have no IPv6 route; Gmail resolves to both and Node may pick v6
+
   connectionTimeout: 20000, greetingTimeout: 20000, socketTimeout: 30000,
 }));
 
