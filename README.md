@@ -67,6 +67,37 @@ Open the wall with `&desk` in the URL and press `D`: search guests, see a guest'
 QR, resend their email, release a code back to the pool, do a manual check-in for walk-ins,
 export a CSV, change settings (event, pool mode, poll interval).
 
+## Dev and live on one deployment
+
+The wall has no build-time modes: a dev deployment is the same image with different env vars.
+`SUPABASE_ROW_ID` is the important one - dev and live read separate rows of `wall_state`, so a
+test check-in can never consume a code from the real allocation list.
+
+| Variable | Dev | Live |
+|---|---|---|
+| `SUPABASE_ROW_ID` | `dev` | `default` |
+| `EMAIL_TEST_TO` | your address | *(blank)* |
+| `WALL_TOKEN` | a throwaway token | the real one |
+| `data/codes.json` | absent, so the placeholder codes are used | the real codes |
+
+Going live is editing those in the host's dashboard and redeploying. Nothing is rebuilt.
+
+Check the startup banner before doors open. It prints the row in use and, when
+`EMAIL_TEST_TO` is set, `ALL mail redirected to ...` - if you see that line on event day, every
+guest email is going to you instead of to guests.
+
+Smoke test a deployment (`$URL` and `$KEY` being the host URL and `WALL_TOKEN`):
+
+```sh
+curl "$URL/state?key=$KEY"                       # luma.error empty, guest total sane
+curl -X POST "$URL/email/test" -H 'content-type: application/json' -d '{"to":"you@example.com"}'
+curl -X POST "$URL/allocate?key=$KEY" -H 'content-type: application/json' \
+  -d '{"key":"smoke","name":"Smoke Test","email":"you@example.com"}'
+curl -X POST "$URL/release?key=$KEY" -H 'content-type: application/json' -d '{"key":"smoke"}'
+```
+
+The last line returns the code to the pool, so a smoke test costs nothing.
+
 ## State storage
 
 By default the server keeps allocations in `data/state.json`. Set `SUPABASE_URL` and
