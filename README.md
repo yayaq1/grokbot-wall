@@ -46,7 +46,9 @@ Aimed at Render / Koyeb / similar: no persistent disk, sleeps after ~15 min with
 inbound traffic, and may flag free services that make an uncommonly high volume of
 outbound requests. Supabase free-tier projects pause after about a week of low DB activity.
 
-1. Create a Supabase project and run the SQL below once.
+1. Create / open the shared Supabase project and run [`supabase/schema.sql`](supabase/schema.sql)
+   once in the SQL editor. It only creates the namespaced table `grokbot_wall_state`
+   (`CREATE IF NOT EXISTS`, RLS on, no public policies) and does not touch other apps' tables.
 2. Deploy this repo as a Node web service. Start command: `npm start` (or
    `node build.mjs && node serve.mjs`). `PORT` is honored automatically.
 3. Env vars to set on the host:
@@ -141,8 +143,8 @@ SMTP over a Gmail or Workspace app password is fine locally and on hosts that pe
 ## Dev and live on one deployment
 
 The wall has no build-time modes: a dev deployment is the same image with different env vars.
-`SUPABASE_ROW_ID` is the important one — dev and live read separate rows of `wall_state`, so a
-test check-in can never consume a code from the real allocation list.
+`SUPABASE_ROW_ID` is the important one — dev and live read separate rows of
+`grokbot_wall_state`, so a test check-in can never consume a code from the real allocation list.
 
 | Variable | Dev | Live |
 |---|---|---|
@@ -187,16 +189,17 @@ Postgres instead, which is what makes a host with no persistent disk safe — th
 after any restart or sleep. The JSON file is still written when the disk allows, as a local
 cache.
 
-Create the table once, in the Supabase SQL editor:
+The Supabase project may be shared with other apps. Create only this app's objects by running
+[`supabase/schema.sql`](supabase/schema.sql) once in the SQL editor:
 
-```sql
-create table if not exists wall_state (
-  id text primary key,
-  data jsonb not null,
-  updated_at timestamptz not null default now()
-);
-alter table wall_state enable row level security;
+```sh
+# or paste the file into the Supabase → SQL → New query editor
+psql "$DATABASE_URL" -f supabase/schema.sql
 ```
+
+That script is idempotent and namespaced (`grokbot_wall_*`): `CREATE … IF NOT EXISTS` only, no
+drops or alterations of other tables, RLS enabled with **no** policies (anon cannot read;
+`service_role` used by `serve.mjs` bypasses RLS).
 
 The `data` jsonb document is versioned by the app (`version: 2`). Shape:
 
@@ -246,6 +249,7 @@ bot form and colour · `?raw` 3D scene without the ASCII pass.
 src/index.html           the wall (three.js UMD + qrcode-generator are inlined by the build)
 serve.mjs                server: static, Luma, per-event allocation, email, webhook
 scripts/import-legacy.mjs  one-off migration of legacy state.json + codes.json
+supabase/schema.sql      namespaced table for a shared Supabase project
 build.mjs                → dist/index.html  (--no-codes for a public copy)
 tunnel.mjs               laptop mode: cloudflared quick tunnel + webhook lifecycle
 hook-relay.mjs           exposes only the webhook path for that tunnel

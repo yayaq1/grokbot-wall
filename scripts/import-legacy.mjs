@@ -170,8 +170,9 @@ if (opts.supabase) {
   const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
   const SB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
   const SB_ROW = process.env.SUPABASE_ROW_ID || 'default';
+  const SB_TABLE = 'grokbot_wall_state';
   if (!SB_URL || !SB_KEY) die('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY required for --supabase');
-  const r = await fetch(`${SB_URL}/rest/v1/wall_state?on_conflict=id`, {
+  const r = await fetch(`${SB_URL}/rest/v1/${SB_TABLE}?on_conflict=id`, {
     method: 'POST',
     headers: {
       apikey: SB_KEY, authorization: `Bearer ${SB_KEY}`,
@@ -180,5 +181,5 @@ if (opts.supabase) {
     body: JSON.stringify({ id: SB_ROW, data: base, updated_at: new Date().toISOString() }),
   });
   if (!r.ok) die(`supabase upsert failed: ${r.status} ${(await r.text()).slice(0, 300)}`);
-  console.log(`  ✓ upserted supabase row "${SB_ROW}"`);
+  console.log(`  ✓ upserted supabase ${SB_TABLE} row "${SB_ROW}"`);
 }

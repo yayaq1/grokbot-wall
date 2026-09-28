@@ -39,16 +39,18 @@ const STATE_FILE = path.join(ROOT, 'data/state.json');
 const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const SB_ROW = process.env.SUPABASE_ROW_ID || 'default';
+// Namespaced table — see supabase/schema.sql (shared project with other apps).
+const SB_TABLE = 'grokbot_wall_state';
 const sbOn = Boolean(SB_URL && SB_KEY);
 const sbHeaders = { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}`, 'content-type': 'application/json' };
 async function sbLoad() {
-  const r = await fetch(`${SB_URL}/rest/v1/wall_state?id=eq.${encodeURIComponent(SB_ROW)}&select=data`, { headers: sbHeaders });
+  const r = await fetch(`${SB_URL}/rest/v1/${SB_TABLE}?id=eq.${encodeURIComponent(SB_ROW)}&select=data`, { headers: sbHeaders });
   if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 200)}`);
   const rows = await r.json(); return rows[0] ? rows[0].data : null;
 }
 /** Cheapest authenticated read — keeps a free-tier Supabase project from pausing. No row payload used. */
 async function sbTouch() {
-  const r = await fetch(`${SB_URL}/rest/v1/wall_state?id=eq.${encodeURIComponent(SB_ROW)}&select=id`, {
+  const r = await fetch(`${SB_URL}/rest/v1/${SB_TABLE}?id=eq.${encodeURIComponent(SB_ROW)}&select=id`, {
     headers: { ...sbHeaders, accept: 'application/json' },
     signal: AbortSignal.timeout(5000),
   });
@@ -56,7 +58,7 @@ async function sbTouch() {
   await r.arrayBuffer();
 }
 async function sbSave(snapshot) {
-  const r = await fetch(`${SB_URL}/rest/v1/wall_state?on_conflict=id`, {
+  const r = await fetch(`${SB_URL}/rest/v1/${SB_TABLE}?on_conflict=id`, {
     method: 'POST', headers: { ...sbHeaders, prefer: 'resolution=merge-duplicates' },
     body: JSON.stringify({ id: SB_ROW, data: snapshot, updated_at: new Date().toISOString() }),
   });
