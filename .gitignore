@@ -10,4 +10,3 @@ data/codes.json
 .idea/
 data/CODES_JSON.txt
 testdata/imported-state.json
-testdata/blob-for-migrate.json

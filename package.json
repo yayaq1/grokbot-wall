@@ -7,11 +7,9 @@
     "start": "node build.mjs && node serve.mjs",
     "serve": "node serve.mjs",
     "tunnel": "node tunnel.mjs",
-    "import-legacy": "node scripts/import-legacy.mjs",
-    "migrate-normalized": "node scripts/migrate-to-normalized.mjs"
+    "import-legacy": "node scripts/import-legacy.mjs"
   },
   "dependencies": {
-    "nodemailer": "^10.0.1",
-    "pg": "^8.23.0"
+    "nodemailer": "^10.0.1"
   }
 }
