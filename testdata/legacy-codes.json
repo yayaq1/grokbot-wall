@@ -1,0 +1,11 @@
+{
+  "A": [
+    { "code": "LEGACY-001", "url": "https://cursor.com/referral?code=LEGACY-001" },
+    { "code": "LEGACY-002", "url": "https://cursor.com/referral?code=LEGACY-002" },
+    { "code": "LEGACY-003", "url": "https://cursor.com/referral?code=LEGACY-003" },
+    { "code": "LEGACY-004", "url": "https://cursor.com/referral?code=LEGACY-004" },
+    { "code": "LEGACY-005", "url": "https://cursor.com/referral?code=LEGACY-005" }
+  ],
+  "B": [],
+  "labels": { "A": "Pool A", "B": "Pool B" }
+}

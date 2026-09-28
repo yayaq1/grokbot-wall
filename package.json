@@ -6,7 +6,8 @@
     "build": "node build.mjs",
     "start": "node build.mjs && node serve.mjs",
     "serve": "node serve.mjs",
-    "tunnel": "node tunnel.mjs"
+    "tunnel": "node tunnel.mjs",
+    "import-legacy": "node scripts/import-legacy.mjs"
   },
   "dependencies": {
     "nodemailer": "^10.0.1"
