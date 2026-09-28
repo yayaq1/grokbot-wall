@@ -47,31 +47,45 @@ inbound traffic, and may flag free services that make an uncommonly high volume 
 outbound requests. Supabase free-tier projects pause after about a week of low DB activity.
 
 1. Create / open the shared Supabase project and run [`supabase/schema.sql`](supabase/schema.sql)
-   once in the SQL editor. It only creates the namespaced table `grokbot_wall_state`
+   once in the SQL editor. It creates only namespaced `grokbot_wall_*` objects
    (`CREATE IF NOT EXISTS`, RLS on, no public policies) and does not touch other apps' tables.
-2. Deploy this repo as a Node web service. Start command: `npm start` (or
+2. If you still have data in the legacy `grokbot_wall_state` JSON blob, run the migration
+   (see **Cutover checklist** below) before or right after deploying this build.
+3. Deploy this repo as a Node web service. Start command: `npm start` (or
    `node build.mjs && node serve.mjs`). `PORT` is honored automatically.
-3. Env vars to set on the host:
+4. Env vars to set on the host:
    - `PUBLIC_URL=https://wall.cursorpakistan.com` (or your domain)
    - `WALL_TOKEN`, `LUMA_API_KEY`, optional `LUMA_EVENT_ID`
-   - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_ROW_ID=default`
+   - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (normalized tables; `SUPABASE_ROW_ID` only needed for the one-off blob migration)
    - `RESEND_API_KEY` + `EMAIL_FROM=Grok Bot <hello@yourdomain.com>` (or Mailgun)
-   - `CODES_JSON` = minified seed JSON (or import legacy data first — see below)
+   - `CODES_JSON` = minified seed JSON only for a brand-new empty DB (skip if you migrated)
    - Keep `EMAIL_TEST_TO` blank; `EMAIL_DRY_RUN=0`
-   - Optional poll tuning: `POLL_MS` (live, default 5000), `IDLE_POLL_MS` (default 900000 =
-     15 min), `LIVE_BEFORE_MIN` / `LIVE_AFTER_MIN` (default 60 / 120)
-4. Point an uptime pinger at `https://wall.cursorpakistan.com/healthz` every ~5 minutes
-   (no key required). That single request (a) keeps the Render free instance awake and
-   (b) does one trivial Supabase `select id` so the free DB project stays active. The
-   response is only `{ok:true}` — no state is leaked. If Supabase is configured but
-   unreachable, `/healthz` returns `503 {ok:false}`.
-5. Open `https://wall.cursorpakistan.com/?key=<WALL_TOKEN>&desk`, press `D` → **settings**,
-   pick the Luma event from the dropdown, Save. The choice is stored in Supabase and
-   survives sleeps / redeploys. To run the next meetup: pick the new event — the wall and
-   console show only that event's check-ins; past events stay viewable/exportable by
-   switching back. The same person at a new event gets a new code.
-6. To top up codes mid-season: settings → paste a list or CSV → **add codes**. Remaining
-   count is shown in the desk header and settings.
+   - Optional poll tuning: `POLL_MS` / `IDLE_POLL_MS` / `LIVE_BEFORE_MIN` / `LIVE_AFTER_MIN`
+5. Point an uptime pinger at `https://wall.cursorpakistan.com/healthz` every ~5 minutes
+   (no key required). That keeps Render awake and does one trivial Supabase read so the
+   free DB stays active. Response is only `{ok:true}`.
+6. Open `/?key=<WALL_TOKEN>&desk`, press `D` → **settings** to switch events or add codes.
+
+### Cutover checklist (blob → normalized tables)
+
+Already live on `grokbot_wall_state` (row `default`)? Do this once:
+
+1. **Backup** — in Supabase, confirm the `grokbot_wall_state` row looks right (or download it).
+2. **Apply schema** — paste/run [`supabase/schema.sql`](supabase/schema.sql) in the SQL editor
+   (idempotent; leaves the blob table alone).
+3. **Migrate** (preserves mail `sent`/`dry` so nobody is re-emailed; blob untouched):
+   ```sh
+   SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… SUPABASE_ROW_ID=default \
+     node scripts/migrate-to-normalized.mjs --dry-run
+   SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… SUPABASE_ROW_ID=default \
+     node scripts/migrate-to-normalized.mjs
+   ```
+4. **Deploy** this build to Render (same env; no need for `SUPABASE_ROW_ID` at runtime).
+5. **Smoke** — `curl $URL/healthz`, open the wall with `?key=…`, confirm check-in count and
+   that a known guest still shows `sent` (desk). Spot-check Table Editor:
+   `grokbot_wall_allocations` / `grokbot_wall_codes` are now browseable.
+6. **Leave the blob** — do not delete `grokbot_wall_state` until you are happy; it is unused
+   by this build but remains a backup.
 
 ### Luma polling (keeps outbound volume low)
 
@@ -142,86 +156,66 @@ SMTP over a Gmail or Workspace app password is fine locally and on hosts that pe
 
 ## Dev and live on one deployment
 
-The wall has no build-time modes: a dev deployment is the same image with different env vars.
-`SUPABASE_ROW_ID` is the important one — dev and live read separate rows of
-`grokbot_wall_state`, so a test check-in can never consume a code from the real allocation list.
+Use a separate Supabase project, or the same project with a different current event / a
+dev seed of codes. Prefer a throwaway `WALL_TOKEN` and `EMAIL_TEST_TO` on any non-live
+deploy. Locally you can omit Supabase entirely (`data/state.json` file store) or set
+`DATABASE_URL` to a Postgres that has had `supabase/schema.sql` applied.
 
 | Variable | Dev | Live |
 |---|---|---|
-| `SUPABASE_ROW_ID` | `dev` | `default` |
 | `EMAIL_TEST_TO` | your address | *(blank)* |
 | `WALL_TOKEN` | a throwaway token | the real one |
-| `CODES_JSON` / seed | placeholders or a small set | the real pool |
+| Store | file / separate DB | shared Supabase `grokbot_wall_*` |
 
-Going live is editing those in the host's dashboard and redeploying. Nothing is rebuilt.
+Check the startup banner before doors open. When `EMAIL_TEST_TO` is set it prints
+`ALL mail redirected to ...`.
 
-Check the startup banner before doors open. It prints the row in use and, when
-`EMAIL_TEST_TO` is set, `ALL mail redirected to ...` — if you see that line on event day, every
-guest email is going to you instead of to guests.
-
-Smoke test a deployment (`$URL` and `$KEY` being the host URL and `WALL_TOKEN`):
+Smoke test (`$URL` / `$KEY`):
 
 ```sh
-curl "$URL/healthz"                                      # public liveness
-curl "$URL/state?key=$KEY"                               # luma.error empty, guest total sane
+curl "$URL/healthz"
+curl "$URL/state?key=$KEY"
 curl -X POST "$URL/email/test?key=$KEY" -H 'content-type: application/json' -d '{"to":"you@example.com"}'
 curl -X POST "$URL/allocate?key=$KEY" -H 'content-type: application/json' \
   -d '{"key":"smoke","name":"Smoke Test","email":"you@example.com"}'
 curl -X POST "$URL/release?key=$KEY" -H 'content-type: application/json' -d '{"key":"smoke"}'
 ```
 
-The last line returns the code to the pool, so a smoke test costs nothing.
-
 ## Getting the codes to a host
 
-`data/codes.json` is gitignored and is not copied into the image, so a deployed container has
-only the placeholders unless you set `CODES_JSON` or import into Supabase. After the first
-save, the pool is in the store; further codes are added from the staff console (`POST /codes`).
-
-Malformed seed JSON, or JSON without `A` and `B` arrays, exits at boot rather than starting a
-wall that cannot hand out codes.
+After migration the code pool lives in `grokbot_wall_codes` (browseable in the Table Editor).
+Add more from the staff console without redeploying. For a brand-new empty database,
+`CODES_JSON` / `data/codes.json` still seed the pool on first boot.
 
 ## State storage
 
-By default the server keeps allocations (and the code pool, and the current event) in
-`data/state.json`. Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` and it keeps them in
-Postgres instead, which is what makes a host with no persistent disk safe — the wall reloads
-after any restart or sleep. The JSON file is still written when the disk allows, as a local
-cache.
+Three backends (first match wins):
 
-The Supabase project may be shared with other apps. Create only this app's objects by running
-[`supabase/schema.sql`](supabase/schema.sql) once in the SQL editor:
+1. **`DATABASE_URL`** — direct Postgres (local/CI), normalized `grokbot_wall_*` tables
+2. **`SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`** — same tables via PostgREST + RPC
+3. **else** — `data/state.json` file (cheap local/dev fallback)
+
+Normalized tables (all prefixed, RLS on, no public policies) — see [`supabase/schema.sql`](supabase/schema.sql):
+
+| Table | Purpose |
+|---|---|
+| `grokbot_wall_events` | Luma events; `is_current` marks the active meetup |
+| `grokbot_wall_codes` | Shared referral pool; `allocation_id` set ⇒ used (unique on `code`) |
+| `grokbot_wall_allocations` | One row per guest per event + mail status columns |
+| `grokbot_wall_settings` | Key/value config (`poolMode`, poll intervals, labels, …) |
+| `grokbot_wall_state` | **Legacy JSON blob** — kept as backup after migration; unused by the app |
+
+Code hand-out goes through Postgres function `grokbot_wall_allocate` (`FOR UPDATE SKIP LOCKED`)
+so concurrent webhook + poll cannot double-assign a code. Unique `(event_id, guest_key)`
+enforces one allocation per guest per event.
 
 ```sh
-# or paste the file into the Supabase → SQL → New query editor
 psql "$DATABASE_URL" -f supabase/schema.sql
+# or paste into Supabase → SQL → New query
 ```
 
-That script is idempotent and namespaced (`grokbot_wall_*`): `CREATE … IF NOT EXISTS` only, no
-drops or alterations of other tables, RLS enabled with **no** policies (anon cannot read;
-`service_role` used by `serve.mjs` bypasses RLS).
-
-The `data` jsonb document is versioned by the app (`version: 2`). Shape:
-
-```json
-{
-  "version": 2,
-  "config": {
-    "eventId": "evt-…", "eventName": "…", "eventStart": "…", "eventEnd": "…",
-    "poolMode": "A-then-B", "pollMs": 5000, "idlePollMs": 900000,
-    "liveBeforeMs": 3600000, "liveAfterMs": 7200000, "forceFastPoll": false
-  },
-  "codes": { "A": [{ "code": "…", "url": "…" }], "B": [], "labels": { "A": "Pool A", "B": "Pool B" } },
-  "allocations": [
-    { "key": "guest@email", "eventId": "evt-…", "name": "…", "email": "…", "codes": […], "mail": { "status": "sent" } }
-  ]
-}
-```
-
-No RLS policies are needed: the service role key bypasses RLS, and without a policy the anon key
-can read nothing. If Supabase is configured but unreachable at boot the server exits rather than
-start from a stale file, since that would re-issue codes guests already have.
-
+If Supabase/Postgres is configured but unreachable at boot the server exits rather than
+start from a stale file.
 ## How the email queue behaves
 
 Sends are queued at ~2/s with a timeout on each request, retries on rate limits and
@@ -246,15 +240,17 @@ bot form and colour · `?raw` 3D scene without the ASCII pass.
 ## Layout of the repo
 
 ```
-src/index.html           the wall (three.js UMD + qrcode-generator are inlined by the build)
-serve.mjs                server: static, Luma, per-event allocation, email, webhook
-scripts/import-legacy.mjs  one-off migration of legacy state.json + codes.json
-supabase/schema.sql      namespaced table for a shared Supabase project
-build.mjs                → dist/index.html  (--no-codes for a public copy)
-tunnel.mjs               laptop mode: cloudflared quick tunnel + webhook lifecycle
-hook-relay.mjs           exposes only the webhook path for that tunnel
-assets/hero-blue.jpg     email header, from the Grok Bot brand kit
-data/codes.example.json  shape of the referral-code seed file
+src/index.html              the wall (three.js UMD + qrcode-generator are inlined by the build)
+serve.mjs                   server: static, Luma, per-event allocation, email, webhook
+lib/store.mjs               file / Postgres / Supabase persistence
+scripts/migrate-to-normalized.mjs  blob → normalized tables (idempotent)
+scripts/import-legacy.mjs   one-off migration of legacy email-keyed state.json
+supabase/schema.sql         namespaced tables + allocate RPC for a shared project
+build.mjs                   → dist/index.html  (--no-codes for a public copy)
+tunnel.mjs                  laptop mode: cloudflared quick tunnel + webhook lifecycle
+hook-relay.mjs              exposes only the webhook path for that tunnel
+assets/hero-blue.jpg        email header, from the Grok Bot brand kit
+data/codes.example.json     shape of the referral-code seed file
 ```
 
 ## Credits

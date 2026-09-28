@@ -7,6 +7,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
+import { createStore } from './lib/store.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
@@ -14,16 +15,13 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 try {
   for (const line of fs.readFileSync(path.join(ROOT, '.env'), 'utf8').split('\n')) {
     const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].replace(/\s+#.*$/, '').replace(/^["']|["']$/g, '');   // an explicitly empty env var wins over .env
+    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].replace(/\s+#.*$/, '').replace(/^["']|["']$/g, '');
   }
 } catch {}
 
 const KEY = process.env.LUMA_API_KEY || '';
 const PORT = Number(process.env.PORT || 8787);
 const LUMA = 'https://public-api.luma.com';
-// data/codes.json is gitignored and never in the image, so a host with no writable disk carries
-// the real codes in CODES_JSON instead. Same JSON either way — used as the initial seed only;
-// once state is persisted, staff-added codes live in the store.
 const CODES_FILE = fs.existsSync(path.join(ROOT, 'data/codes.json')) ? 'data/codes.json' : 'data/codes.example.json';
 const CODES_SRC = process.env.CODES_JSON ? 'CODES_JSON' : CODES_FILE;
 if (!process.env.CODES_JSON && CODES_FILE.includes('example')) console.warn('  ! data/codes.json not found — using the placeholder codes from data/codes.example.json');
@@ -33,60 +31,41 @@ catch (e) { console.error(`\n  ✗ could not parse codes from ${CODES_SRC}: ${e.
 if (!Array.isArray(seedCodes.A) || !Array.isArray(seedCodes.B)) { console.error(`\n  ✗ codes from ${CODES_SRC} need "A" and "B" arrays\n`); process.exit(1); }
 const STATE_FILE = path.join(ROOT, 'data/state.json');
 
-// ---- state store: Supabase when configured, the JSON file otherwise ----
-// The file is still written either way, as a local cache. On hosts with no disk the write is a
-// no-op or fails quietly; Supabase is the source of truth.
-const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
-const SB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-const SB_ROW = process.env.SUPABASE_ROW_ID || 'default';
-// Namespaced table — see supabase/schema.sql (shared project with other apps).
-const SB_TABLE = 'grokbot_wall_state';
-const sbOn = Boolean(SB_URL && SB_KEY);
-const sbHeaders = { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}`, 'content-type': 'application/json' };
-async function sbLoad() {
-  const r = await fetch(`${SB_URL}/rest/v1/${SB_TABLE}?id=eq.${encodeURIComponent(SB_ROW)}&select=data`, { headers: sbHeaders });
-  if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 200)}`);
-  const rows = await r.json(); return rows[0] ? rows[0].data : null;
-}
-/** Cheapest authenticated read — keeps a free-tier Supabase project from pausing. No row payload used. */
-async function sbTouch() {
-  const r = await fetch(`${SB_URL}/rest/v1/${SB_TABLE}?id=eq.${encodeURIComponent(SB_ROW)}&select=id`, {
-    headers: { ...sbHeaders, accept: 'application/json' },
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!r.ok) throw new Error(`${r.status}`);
-  await r.arrayBuffer();
-}
-async function sbSave(snapshot) {
-  const r = await fetch(`${SB_URL}/rest/v1/${SB_TABLE}?on_conflict=id`, {
-    method: 'POST', headers: { ...sbHeaders, prefer: 'resolution=merge-duplicates' },
-    body: JSON.stringify({ id: SB_ROW, data: snapshot, updated_at: new Date().toISOString() }),
-  });
-  if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 200)}`);
-}
-
 const DEFAULT_CONFIG = {
   eventId: process.env.LUMA_EVENT_ID || null,
   eventName: '',
   eventStart: null,
   eventEnd: null,
   poolMode: 'A-then-B',
-  // Fast poll during the live window; idle poll otherwise (webhook is primary off-window).
   pollMs: Math.max(2000, Number(process.env.POLL_MS) || 5000),
-  idlePollMs: Math.max(60_000, Number(process.env.IDLE_POLL_MS) || 900_000),   // default 15 min
+  idlePollMs: Math.max(60_000, Number(process.env.IDLE_POLL_MS) || 900_000),
   liveBeforeMs: Math.max(0, (Number(process.env.LIVE_BEFORE_MIN) || 60) * 60_000),
   liveAfterMs: Math.max(0, (Number(process.env.LIVE_AFTER_MIN) || 120) * 60_000),
-  forceFastPoll: false,   // staff override: keep fast polling regardless of window
+  forceFastPoll: false,
 };
-let state = { version: 2, allocations: [], codes: null, config: { ...DEFAULT_CONFIG } };
 
-function cloneCodes(c) {
-  return {
-    A: (c.A || []).map(x => ({ code: x.code, url: x.url || referralUrl(x.code) })),
-    B: (c.B || []).map(x => ({ code: x.code, url: x.url || referralUrl(x.code) })),
-    labels: { ...(c.labels || { A: 'Pool A', B: 'Pool B' }) },
-  };
+const store = createStore({
+  root: ROOT,
+  stateFile: STATE_FILE,
+  seedCodes,
+  defaultConfig: DEFAULT_CONFIG,
+  sbUrl: (process.env.SUPABASE_URL || '').replace(/\/$/, ''),
+  sbKey: process.env.SUPABASE_SERVICE_ROLE_KEY || '',
+  databaseUrl: process.env.DATABASE_URL || '',
+});
+const dbOn = store.mode !== 'file';
+
+let state;
+try {
+  state = await store.load();
+  console.log(`  ◇ state from ${store.mode} (${state.allocations.length} allocations, ${allCodeCount(state)} codes)`);
+  if (store.mode === 'file') save();
+} catch (e) {
+  console.error(`\n  ✗ store unreachable: ${e.message}\n    refusing to start on possibly stale state\n`);
+  process.exit(1);
 }
+
+function allCodeCount(s = state) { return (s.codes?.A?.length || 0) + (s.codes?.B?.length || 0); }
 function referralUrl(code) { return `https://cursor.com/referral?code=${encodeURIComponent(code)}`; }
 function allCodeSet(codes = state.codes) {
   const s = new Set();
@@ -98,65 +77,11 @@ function usedCodeSet(allocations = state.allocations) {
   for (const a of allocations) for (const c of a.codes || []) if (c?.code) s.add(c.code);
   return s;
 }
-function mergeSeedInto(codes, seed) {
-  const have = allCodeSet(codes);
-  let added = 0;
-  for (const pool of ['A', 'B']) {
-    for (const c of seed[pool] || []) {
-      if (!c?.code || have.has(c.code)) continue;
-      codes[pool].push({ code: c.code, url: c.url || referralUrl(c.code) });
-      have.add(c.code);
-      added++;
-    }
-  }
-  if (seed.labels) codes.labels = { ...codes.labels, ...seed.labels };
-  return added;
-}
-/** Upgrade legacy (v1) snapshots: tag allocations with an event, seed the code pool. */
-function normalizeState(raw, seed) {
-  const s = {
-    version: 2,
-    allocations: Array.isArray(raw?.allocations) ? raw.allocations.map(a => ({ ...a })) : [],
-    codes: raw?.codes && Array.isArray(raw.codes.A) && Array.isArray(raw.codes.B) ? cloneCodes(raw.codes) : cloneCodes(seed),
-    config: { ...DEFAULT_CONFIG, ...(raw?.config || {}) },
-  };
-  if (!s.config.eventId && process.env.LUMA_EVENT_ID) s.config.eventId = process.env.LUMA_EVENT_ID;
-  // Legacy rows keyed only by email: attach the configured event so they stay visible under it.
-  const fallbackEvent = s.config.eventId || null;
-  for (const a of s.allocations) {
-    if (!a.eventId && fallbackEvent) a.eventId = fallbackEvent;
-    for (const c of a.codes || []) if (!c.n && c.pool && c.code) c.n = codeIndexInPool(s.codes, c.pool, c.code);
-  }
-  mergeSeedInto(s.codes, seed);
-  return s;
-}
-function codeIndexInPool(codes, pool, code) {
-  const i = (codes[pool] || []).findIndex(x => x.code === code);
-  return i >= 0 ? i + 1 : 0;
-}
 
-const merge = s => { state = normalizeState({ ...state, ...s, config: { ...state.config, ...(s.config || {}) }, codes: s.codes || state.codes, allocations: s.allocations ?? state.allocations }, seedCodes); };
-if (sbOn) {
-  // Fail fast rather than start from a stale file: running on the wrong allocation list hands
-  // guests codes that were already given away. Free hosts restart us, so a blip self-heals.
-  let remote;
-  try { remote = await sbLoad(); }
-  catch (e) { console.error(`\n  ✗ supabase unreachable: ${e.message}\n    refusing to start on possibly stale state — fix SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY\n`); process.exit(1); }
-  if (remote) { merge(remote); console.log(`  ◇ state from supabase (${state.allocations.length} allocations, ${allCodeSet().size} codes)`); }
-  else { state = normalizeState(state, seedCodes); console.log('  ◇ supabase reachable, no state row yet — starting fresh'); }
-} else {
-  try { merge(JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))); } catch { state = normalizeState(state, seedCodes); }
-}
-
-let sbChain = Promise.resolve();
+/** File-mode: write full snapshot. DB-mode: no-op here (mutations write through). */
 const save = () => {
-  try { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); } catch (e) { if (sbOn) { /* ephemeral disk — supabase is SoT */ } else console.error(`  ✗ state file write failed: ${e.message}`); }
-  if (!sbOn) return;
-  const snapshot = structuredClone(state);   // state keeps mutating while the request is in flight
-  sbChain = sbChain.then(() => sbSave(snapshot)).catch(e => console.error(`  ✗ supabase save failed: ${e.message}`));
+  if (store.mode === 'file') store.saveFile(state);
 };
-// Persist normalized shape (codes in store, event tags) so a restart sees the same pool.
-save();
 
 function currentEventId() { return state.config.eventId || (luma.event && luma.event.id) || null; }
 function allocsFor(eventId) {
@@ -176,6 +101,12 @@ function poolStats() {
     used: { A: (state.codes.A || []).filter(c => used.has(c.code)).length, B: (state.codes.B || []).filter(c => used.has(c.code)).length },
     remaining: { A: rem('A'), B: rem('B'), total: rem('A') + rem('B') },
   };
+}
+
+function upsertAllocMemory(a) {
+  const i = state.allocations.findIndex(x => x.eventId === a.eventId && x.key === a.key);
+  if (i >= 0) state.allocations[i] = a;
+  else state.allocations.push(a);
 }
 
 // ---- email (Resend / Mailgun / SMTP) ----
@@ -435,7 +366,13 @@ function rememberEvent(ev) {
   state.config.eventName = ev.name || state.config.eventName || '';
   state.config.eventStart = ev.start_at || state.config.eventStart || null;
   state.config.eventEnd = ev.end_at || null;
-  if (changed) save();
+  if (changed) {
+    save();
+    store.saveConfig(state.config).catch(e => console.error(`  ✗ config save failed: ${e.message}`));
+    store.upsertEvent({
+      id: ev.id, name: ev.name || '', start_at: ev.start_at || null, end_at: ev.end_at || null, is_current: true,
+    }).catch(e => console.error(`  ✗ event upsert failed: ${e.message}`));
+  }
 }
 
 /** Live window: [start − liveBefore, end + liveAfter]. Unknown schedule → idle (webhook + slow poll). */
@@ -482,7 +419,7 @@ async function pollLuma() {
         const g = normGuest(e); luma.guests.set(g.key, g); count++;
         if (g.checkedInAt) {
           if (!findAlloc(eventId, g.key)) {
-            const a = allocate({ ...g, source: 'luma', eventId });
+            const a = await allocate({ ...g, source: 'luma', eventId });
             console.log(`  ✓ check-in ${g.name}  → ${a.codes.map(c => c.pool + '#' + c.n).join('+') || 'no codes left'}`);
           }
         } else if (!full) stop = true;
@@ -559,6 +496,7 @@ async function pumpMail() {
       catch (e) { a.mail = { status: 'failed', to: a.email, at: new Date().toISOString(), error: String(e.message || e) }; }
       a.mail.tries = tries;
       save();
+      store.updateMail(a).catch(e => console.error(`  ✗ mail persist failed: ${e.message}`));
       if (a.mail.status === 'failed') console.log(`  ✉ FAILED → ${a.mail.to}: ${a.mail.error}`);
       await sleep(600);
     }
@@ -584,26 +522,42 @@ function requeueStale(all = false) {
     a.mail = { status: 'queued', at: new Date().toISOString(), tries: (m && m.tries) || 0 };
     mailQueue.push(mk); n++;
   }
-  if (n) { console.log(`  ✉ re-queued ${n} stale email(s)`); save(); pumpMail(); }
+  if (n) { console.log(`  ✉ re-queued ${n} stale email(s)`); save(); for (const a of state.allocations) if (a.mail?.status === 'queued') store.updateMail(a).catch(() => {}); pumpMail(); }
 }
 setTimeout(() => requeueStale(true), 2000); setInterval(() => requeueStale(false), 20_000);
 
-function allocate(body) {
+async function allocate(body) {
   let eventId = body.eventId || currentEventId();
   if (!eventId) {
-    // Manual / smoke-test path with no Luma event pinned yet.
     eventId = 'local';
-    if (!state.config.eventId) { state.config.eventId = eventId; state.config.eventName = state.config.eventName || EVENT_NAME_FALLBACK || 'Local'; }
+    if (!state.config.eventId) {
+      state.config.eventId = eventId;
+      state.config.eventName = state.config.eventName || EVENT_NAME_FALLBACK || 'Local';
+      save();
+      store.saveConfig(state.config).catch(() => {});
+    }
   }
   const key = String(body.key || '').trim().toLowerCase();
   if (!key) throw new Error('key required');
   const existing = findAlloc(eventId, key);
   if (existing) return existing;
+
+  if (dbOn) {
+    const a = await store.allocateAtomic({ ...body, key, eventId }, state.config);
+    if (a) {
+      upsertAllocMemory(a);
+      // Mark picked codes as used in the in-memory pool view (n already set).
+      enqueueMail(a);
+      save();
+      return a;
+    }
+  }
+
   const used = usedCodeSet();
   const pick = pool => {
     const list = state.codes[pool] || [];
     const i = list.findIndex(c => !used.has(c.code));
-    return i >= 0 ? { pool, code: list[i].code, url: list[i].url || referralUrl(list[i].code), n: i + 1 } : null;
+    return i >= 0 ? { pool, code: list[i].code, url: list[i].url || referralUrl(list[i].code), n: list[i].n || i + 1 } : null;
   };
   const codes = [];
   if (state.config.poolMode === 'both') {
@@ -653,14 +607,21 @@ function parseCodePaste(raw, pool = 'A') {
   }
   return out;
 }
-function addCodes(entries) {
+async function addCodes(entries) {
+  if (dbOn) {
+    const r = await store.addCodes(entries.map(e => ({ ...e, url: e.url || referralUrl(e.code) })));
+    // Refresh code inventory from DB so positions/dupes match.
+    const fresh = await store.load();
+    state.codes = fresh.codes;
+    return { added: r?.added ?? 0, skipped: r?.skipped ?? 0, pools: poolStats() };
+  }
   const have = allCodeSet();
   let added = 0, skipped = 0;
   for (const e of entries) {
     if (!e.code) continue;
     if (have.has(e.code)) { skipped++; continue; }
     const pool = e.pool === 'B' ? 'B' : 'A';
-    state.codes[pool].push({ code: e.code, url: e.url || referralUrl(e.code) });
+    state.codes[pool].push({ code: e.code, url: e.url || referralUrl(e.code), n: state.codes[pool].length + 1 });
     have.add(e.code);
     added++;
   }
@@ -694,8 +655,8 @@ const server = http.createServer(async (req, res) => {
     // Public liveness for uptime pingers. Touches Supabase when configured so a free-tier
     // project stays active; response never includes row data.
     if (url.pathname === '/healthz' && req.method === 'GET') {
-      if (sbOn) {
-        try { await sbTouch(); }
+      if (dbOn) {
+        try { await store.touch(); }
         catch { return json(res, 503, { ok: false }); }
       }
       return json(res, 200, { ok: true });
@@ -723,7 +684,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
     if (url.pathname === '/state' && req.method === 'GET') return json(res, 200, publicState());
-    if (url.pathname === '/allocate' && req.method === 'POST') return json(res, 200, { allocation: allocate(await readBody(req)) });
+    if (url.pathname === '/allocate' && req.method === 'POST') return json(res, 200, { allocation: await allocate(await readBody(req)) });
     if (url.pathname === '/config' && req.method === 'POST') {
       const b = await readBody(req);
       const prevEvent = state.config.eventId;
@@ -737,6 +698,7 @@ const server = http.createServer(async (req, res) => {
         state.config[k] = v;
       }
       save();
+      await store.saveConfig(state.config).catch(e => console.error(`  ✗ config save failed: ${e.message}`));
       lastLoggedPollMode = null;
       if (state.config.eventId !== prevEvent) {
         luma.event = null; luma.fullAt = 0; luma.guests.clear();
@@ -751,7 +713,7 @@ const server = http.createServer(async (req, res) => {
       const pool = b.pool === 'B' ? 'B' : 'A';
       const entries = Array.isArray(b.codes) ? b.codes.map(c => typeof c === 'string' ? { code: c, pool } : { code: c.code, url: c.url, pool: c.pool || pool })
         : parseCodePaste(b.text || b.csv || '', pool);
-      const result = addCodes(entries);
+      const result = await addCodes(entries);
       console.log(`  ⊕ codes +${result.added} (skipped ${result.skipped} dupes) · remaining ${result.pools.remaining.total}`);
       return json(res, 200, result);
     }
@@ -760,16 +722,18 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req); const eventId = b.eventId || currentEventId();
       const a = findAlloc(eventId, String(b.key || '').toLowerCase());
       if (!a) return json(res, 404, { message: 'no allocation for that key' });
-      enqueueMail(a, { force: true }); save(); return json(res, 200, { allocation: a });
+      enqueueMail(a, { force: true }); save(); store.updateMail(a).catch(() => {}); return json(res, 200, { allocation: a });
     }
-    if (url.pathname === '/email/status') return json(res, 200, { busy: mailBusy, queue: [...mailQueue], version: 'v5' });
+    if (url.pathname === '/email/status') return json(res, 200, { busy: mailBusy, queue: [...mailQueue], version: 'v6' });
     if (url.pathname === '/email/sweep' && req.method === 'POST') { const before = mailQueue.length; requeueStale(); return json(res, 200, { queuedBefore: before, queue: [...mailQueue], busy: mailBusy }); }
     if (url.pathname === '/email/send-now' && req.method === 'POST') {
       const b = await readBody(req); const eventId = b.eventId || currentEventId();
       const a = findAlloc(eventId, String(b.key || '').toLowerCase());
       if (!a) return json(res, 404, { message: 'no allocation for that key' });
       if (!emailEnabled() || !isEmail(a.email) || !a.codes.length) return json(res, 400, { message: 'cannot send for this allocation' });
-      a.mail = await deliver(a); a.mail.tries = ((a.mail && a.mail.tries) || 0) + 1; save(); return json(res, 200, { allocation: a });
+      a.mail = await deliver(a); a.mail.tries = ((a.mail && a.mail.tries) || 0) + 1; save();
+      await store.updateMail(a).catch(() => {});
+      return json(res, 200, { allocation: a });
     }
     if (url.pathname === '/email/test' && req.method === 'POST') {
       const b = await readBody(req); const to = String(b.to || '').trim();
@@ -785,20 +749,23 @@ const server = http.createServer(async (req, res) => {
       const eventId = b.eventId || currentEventId();
       const i = state.allocations.findIndex(x => x.key === key && x.eventId === eventId);
       if (i < 0) return json(res, 404, { message: 'no allocation for that key' });
-      const [a] = state.allocations.splice(i, 1); save();
+      const [a] = state.allocations.splice(i, 1);
+      if (dbOn) await store.release(eventId, key);
+      save();
       console.log(`  ↩ released ${a.name || a.key} @ ${eventId}  (${a.codes.map(c => c.pool + '#' + c.n).join('+') || 'no codes'}) — back in the pool`);
       if (KEY) { luma.fullAt = 0; schedulePoll(400); }
       return json(res, 200, { ok: true, released: a });
     }
     if (url.pathname === '/reset' && req.method === 'POST') {
-      // Reset only the current event's allocations; other events and the shared code inventory stay.
       const eventId = currentEventId();
       const keep = state.allocations.filter(a => a.eventId !== eventId);
       const cleared = state.allocations.length - keep.length;
       if (cleared) {
         try { fs.writeFileSync(STATE_FILE.replace(/\.json$/, `.backup-${Date.now()}.json`), JSON.stringify(state, null, 2)); } catch {}
       }
-      state.allocations = keep; save(); luma.fullAt = 0; if (KEY) schedulePoll(500);
+      state.allocations = keep;
+      if (dbOn && eventId) await store.resetEvent(eventId);
+      save(); luma.fullAt = 0; if (KEY) schedulePoll(500);
       return json(res, 200, { ok: true, cleared, eventId });
     }
     if (url.pathname.startsWith('/luma/')) {
@@ -838,7 +805,7 @@ server.listen(PORT, () => {
   console.log(`    codes   A=${ps.A} B=${ps.B} · remaining ${ps.remaining.total} · seed ${CODES_SRC} · allocated ${state.allocations.length} across events`);
   const ei = emailInfo();
   console.log(`    email   ${!ei.enabled ? 'OFF (set RESEND_API_KEY, MAILGUN_*, or SMTP_USER/SMTP_PASS)' : ei.dryRun ? 'DRY RUN (logs only)' : (ei.provider || ei.host) + ' · from ' + ei.from + (ei.testTo ? ' · ALL mail redirected to ' + ei.testTo : '')}`);
-  console.log(`    state   ${sbOn ? 'supabase · row ' + SB_ROW : path.relative(process.cwd(), STATE_FILE)}`);
-  console.log(`    health  /healthz (public${sbOn ? ', touches supabase' : ''})\n`);
+  console.log(`    state   ${store.mode}${store.mode === 'file' ? ' · ' + path.relative(process.cwd(), STATE_FILE) : ''}`);
+  console.log(`    health  /healthz (public${dbOn ? ', touches supabase/db' : ''})\n`);
   if (KEY) { schedulePoll(300); registerWebhook(); }
 });
