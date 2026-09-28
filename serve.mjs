@@ -46,6 +46,15 @@ async function sbLoad() {
   if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 200)}`);
   const rows = await r.json(); return rows[0] ? rows[0].data : null;
 }
+/** Cheapest authenticated read — keeps a free-tier Supabase project from pausing. No row payload used. */
+async function sbTouch() {
+  const r = await fetch(`${SB_URL}/rest/v1/wall_state?id=eq.${encodeURIComponent(SB_ROW)}&select=id`, {
+    headers: { ...sbHeaders, accept: 'application/json' },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!r.ok) throw new Error(`${r.status}`);
+  await r.arrayBuffer();
+}
 async function sbSave(snapshot) {
   const r = await fetch(`${SB_URL}/rest/v1/wall_state?on_conflict=id`, {
     method: 'POST', headers: { ...sbHeaders, prefer: 'resolution=merge-duplicates' },
@@ -54,7 +63,19 @@ async function sbSave(snapshot) {
   if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 200)}`);
 }
 
-const DEFAULT_CONFIG = { eventId: process.env.LUMA_EVENT_ID || null, eventName: '', poolMode: 'A-then-B', pollMs: 5000 };
+const DEFAULT_CONFIG = {
+  eventId: process.env.LUMA_EVENT_ID || null,
+  eventName: '',
+  eventStart: null,
+  eventEnd: null,
+  poolMode: 'A-then-B',
+  // Fast poll during the live window; idle poll otherwise (webhook is primary off-window).
+  pollMs: Math.max(2000, Number(process.env.POLL_MS) || 5000),
+  idlePollMs: Math.max(60_000, Number(process.env.IDLE_POLL_MS) || 900_000),   // default 15 min
+  liveBeforeMs: Math.max(0, (Number(process.env.LIVE_BEFORE_MIN) || 60) * 60_000),
+  liveAfterMs: Math.max(0, (Number(process.env.LIVE_AFTER_MIN) || 120) * 60_000),
+  forceFastPoll: false,   // staff override: keep fast polling regardless of window
+};
 let state = { version: 2, allocations: [], codes: null, config: { ...DEFAULT_CONFIG } };
 
 function cloneCodes(c) {
@@ -403,12 +424,38 @@ async function resolveEvent() {
   const ev = (j.entries || []).map(e => e.event || e)[0]; if (!ev) throw new Error('no upcoming events on this calendar'); return ev;
 }
 function rememberEvent(ev) {
-  luma.event = { id: ev.id, name: ev.name, start_at: ev.start_at };
-  const changed = state.config.eventId !== ev.id || state.config.eventName !== ev.name;
+  luma.event = { id: ev.id, name: ev.name, start_at: ev.start_at || null, end_at: ev.end_at || null };
+  const changed = state.config.eventId !== ev.id
+    || state.config.eventName !== ev.name
+    || state.config.eventStart !== (ev.start_at || null)
+    || state.config.eventEnd !== (ev.end_at || null);
   state.config.eventId = ev.id;
   state.config.eventName = ev.name || state.config.eventName || '';
+  state.config.eventStart = ev.start_at || state.config.eventStart || null;
+  state.config.eventEnd = ev.end_at || null;
   if (changed) save();
 }
+
+/** Live window: [start − liveBefore, end + liveAfter]. Unknown schedule → idle (webhook + slow poll). */
+function inLiveWindow(now = Date.now()) {
+  if (state.config.forceFastPoll) return true;
+  const start = Date.parse(state.config.eventStart || (luma.event && luma.event.start_at) || '') || NaN;
+  if (!Number.isFinite(start)) return false;
+  let end = Date.parse(state.config.eventEnd || (luma.event && luma.event.end_at) || '') || NaN;
+  if (!Number.isFinite(end)) end = start + 3 * 3600e3;   // Luma sometimes omits end_at; assume ~3h meetup
+  const before = state.config.liveBeforeMs ?? DEFAULT_CONFIG.liveBeforeMs;
+  const after = state.config.liveAfterMs ?? DEFAULT_CONFIG.liveAfterMs;
+  return now >= start - before && now <= end + after;
+}
+function pollMode() {
+  if (state.config.forceFastPoll) return 'force-fast';
+  return inLiveWindow() ? 'live' : 'idle';
+}
+function effectivePollMs() {
+  return inLiveWindow() ? (state.config.pollMs || DEFAULT_CONFIG.pollMs) : (state.config.idlePollMs || DEFAULT_CONFIG.idlePollMs);
+}
+
+let lastLoggedPollMode = null;
 async function pollLuma() {
   if (!KEY || luma.running) return; luma.running = true;
   try {
@@ -416,6 +463,14 @@ async function pollLuma() {
       const ev = await resolveEvent(); rememberEvent(ev);
       const gc = ev.guest_counts && ev.guest_counts.approved; if (gc) luma.total = gc.guests || 0;
       console.log(`  ◎ luma event ${ev.id} "${ev.name}"`);
+    } else if (!state.config.eventStart || (luma.event.start_at && !state.config.eventEnd && Date.now() - luma.lastSync > 600_000)) {
+      // Refresh schedule occasionally so a moved event updates the live window.
+      try { const ev = await lumaGet('/v1/events/get', { event_id: luma.event.id }); rememberEvent(ev.event || ev); } catch {}
+    }
+    const mode = pollMode();
+    if (mode !== lastLoggedPollMode) {
+      console.log(`  ◎ poll mode → ${mode} (every ${Math.round(effectivePollMs() / 1000)}s)`);
+      lastLoggedPollMode = mode;
     }
     const eventId = luma.event.id;
     const full = Date.now() - luma.fullAt > 60_000; let cursor = null, pages = 0, stop = false, count = 0;
@@ -437,7 +492,12 @@ async function pollLuma() {
   } catch (e) { luma.error = e.message; console.log(`  ✗ luma: ${e.message}`); }
   finally { luma.running = false; }
 }
-function schedulePoll(ms) { clearTimeout(luma.timer); luma.timer = setTimeout(async () => { await pollLuma(); schedulePoll(state.config.pollMs || 5000); }, ms); }
+/** Schedule next Luma poll. Pass an explicit delay to nudge (webhook); omit to use live/idle interval. */
+function schedulePoll(ms) {
+  clearTimeout(luma.timer);
+  const delay = ms != null ? ms : effectivePollMs();
+  luma.timer = setTimeout(async () => { await pollLuma(); schedulePoll(); }, delay);
+}
 async function registerWebhook() {
   if (!KEY || !PUBLIC_URL) return;
   try {
@@ -617,15 +677,27 @@ const publicState = () => {
     pools: { A: ps.A, B: ps.B, used: ps.used, remaining: ps.remaining },
     labels: state.codes.labels,
     lastWebhookAt,
-    luma: { serverPolls: Boolean(KEY), event: luma.event || (eventId ? { id: eventId, name: state.config.eventName || null } : null), total: luma.total, lastSync: luma.lastSync, error: luma.error },
+    poll: { mode: pollMode(), nextMs: effectivePollMs(), live: inLiveWindow() },
+    luma: {
+      serverPolls: Boolean(KEY),
+      event: luma.event || (eventId ? { id: eventId, name: state.config.eventName || null, start_at: state.config.eventStart, end_at: state.config.eventEnd } : null),
+      total: luma.total, lastSync: luma.lastSync, error: luma.error,
+    },
   };
 };
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
-    // Public, cheap liveness for uptime pingers (no wall key). Does not touch Luma or the store.
-    if (url.pathname === '/healthz' && req.method === 'GET') return json(res, 200, { ok: true });
+    // Public liveness for uptime pingers. Touches Supabase when configured so a free-tier
+    // project stays active; response never includes row data.
+    if (url.pathname === '/healthz' && req.method === 'GET') {
+      if (sbOn) {
+        try { await sbTouch(); }
+        catch { return json(res, 503, { ok: false }); }
+      }
+      return json(res, 200, { ok: true });
+    }
     if (url.pathname === '/webhooks/luma' && req.method === 'POST') { recordWebhook(req, await readBody(req)); return json(res, 200, { ok: true }); }
     if (url.pathname.startsWith('/assets/') && req.method === 'GET') {
       const f = path.join(ROOT, 'assets', path.normalize(url.pathname.slice('/assets/'.length)).replace(/^(\.\.[/\\])+/, ''));
@@ -645,6 +717,7 @@ const server = http.createServer(async (req, res) => {
         eventName: currentEventName(), eventId: state.config.eventId,
         pools: { A: ps.A, B: ps.B, remaining: ps.remaining, used: ps.used },
         email: emailInfo(),
+        poll: { mode: pollMode(), nextMs: effectivePollMs(), live: inLiveWindow(), forceFastPoll: !!state.config.forceFastPoll },
       });
     }
     if (url.pathname === '/state' && req.method === 'GET') return json(res, 200, publicState());
@@ -652,15 +725,23 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/config' && req.method === 'POST') {
       const b = await readBody(req);
       const prevEvent = state.config.eventId;
-      for (const k of ['eventId', 'eventName', 'poolMode', 'pollMs']) if (k in b) state.config[k] = b[k];
+      for (const k of ['eventId', 'eventName', 'eventStart', 'eventEnd', 'poolMode', 'pollMs', 'idlePollMs', 'liveBeforeMs', 'liveAfterMs', 'forceFastPoll']) {
+        if (!(k in b)) continue;
+        let v = b[k];
+        if (k === 'forceFastPoll') v = Boolean(v);
+        if (k === 'pollMs') v = Math.max(2000, Number(v) || DEFAULT_CONFIG.pollMs);
+        if (k === 'idlePollMs') v = Math.max(60_000, Number(v) || DEFAULT_CONFIG.idlePollMs);
+        if (k === 'liveBeforeMs' || k === 'liveAfterMs') v = Math.max(0, Number(v) || 0);
+        state.config[k] = v;
+      }
       save();
+      lastLoggedPollMode = null;
       if (state.config.eventId !== prevEvent) {
         luma.event = null; luma.fullAt = 0; luma.guests.clear();
-        // Drop in-flight queue entries for the previous event; their allocs stay (viewable when switched back).
         for (let i = mailQueue.length - 1; i >= 0; i--) if (parseMailKey(mailQueue[i]).eventId === prevEvent) mailQueue.splice(i, 1);
       }
       if (KEY) schedulePoll(200);
-      return json(res, 200, { config: state.config });
+      return json(res, 200, { config: state.config, poll: { mode: pollMode(), nextMs: effectivePollMs() } });
     }
     if (url.pathname === '/codes' && req.method === 'GET') return json(res, 200, { pools: poolStats(), labels: state.codes.labels, total: allCodeSet().size });
     if (url.pathname === '/codes' && req.method === 'POST') {
@@ -748,7 +829,7 @@ server.listen(PORT, () => {
   console.log(`\n  ● Grok Bot check-in wall`);
   console.log(`    local   http://localhost:${PORT}`);
   if (lan) console.log(`    lan     http://${lan}:${PORT}   (open on a second device for the desk)`);
-  console.log(`    luma    ${KEY ? `API key loaded · server polls every ${Math.round((state.config.pollMs || 5000) / 1000)}s` : 'NO API KEY → wall runs in demo mode (set LUMA_API_KEY in .env)'}`);
+  console.log(`    luma    ${KEY ? `API key loaded · poll ${pollMode()} every ${Math.round(effectivePollMs() / 1000)}s (live ${Math.round((state.config.pollMs || 5000) / 1000)}s / idle ${Math.round((state.config.idlePollMs || 900000) / 1000)}s)` : 'NO API KEY → wall runs in demo mode (set LUMA_API_KEY in .env)'}`);
   console.log(`    auth    ${WALL_TOKEN ? 'token set → open /?key=' + WALL_TOKEN.slice(0, 4) + '…' : 'OPEN — set WALL_TOKEN before exposing this publicly'}`);
   if (PUBLIC_URL) console.log(`    public  ${PUBLIC_URL}`);
   console.log(`    event   ${state.config.eventId || '(auto)'} ${state.config.eventName ? `"${state.config.eventName}"` : ''}`);
@@ -756,6 +837,6 @@ server.listen(PORT, () => {
   const ei = emailInfo();
   console.log(`    email   ${!ei.enabled ? 'OFF (set RESEND_API_KEY, MAILGUN_*, or SMTP_USER/SMTP_PASS)' : ei.dryRun ? 'DRY RUN (logs only)' : (ei.provider || ei.host) + ' · from ' + ei.from + (ei.testTo ? ' · ALL mail redirected to ' + ei.testTo : '')}`);
   console.log(`    state   ${sbOn ? 'supabase · row ' + SB_ROW : path.relative(process.cwd(), STATE_FILE)}`);
-  console.log(`    health  /healthz (public)\n`);
+  console.log(`    health  /healthz (public${sbOn ? ', touches supabase' : ''})\n`);
   if (KEY) { schedulePoll(300); registerWebhook(); }
 });

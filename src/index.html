@@ -146,11 +146,12 @@ const app = {
   guests: new Map(),       // key -> {key,id,name,email,checkedInAt,approval}
   alloc: new Map(),        // key -> allocation
   feed: [],                // allocations newest first
-  config: { eventId: null, poolMode: 'A-then-B', pollMs: 5000 },
+  config: { eventId: null, poolMode: 'A-then-B', pollMs: 5000, idlePollMs: 900000, forceFastPoll: false },
   labels: (CODES && CODES.labels) || { A: 'Pool A', B: 'Pool B' },
   poolTotals: { A: CODES ? CODES.A.length : 0, B: CODES ? CODES.B.length : 0 },
   poolUsed: { A: 0, B: 0 },
   poolRemaining: null,     // {A,B,total} from server — shared across events
+  poll: { mode: '', nextMs: 0, live: false },
   lastSync: 0, syncing: false, error: '', initial: true, persist: false, email: null, lastWebhookAt: null, serverPolls: false, failedSyncs: 0, headline: '',
   dirty: true,
 };
@@ -287,6 +288,7 @@ async function syncState() {
     const r = await api('/state'); if (!r.ok) throw new Error('state ' + r.status);
     const s = await r.json(); app.failedSyncs = 0;
     app.labels = s.labels || app.labels; applyPoolStats(s.pools);
+    if (s.poll) app.poll = s.poll;
     if (app.serverPolls && s.luma) {
       if (s.luma.event) { app.eventId = s.luma.event.id; app.eventName = s.luma.event.name || app.eventName; }
       app.total = Math.max(s.luma.total || 0, (s.allocations || []).length); app.lastSync = s.luma.lastSync || app.lastSync; app.error = s.luma.error || '';
@@ -954,7 +956,7 @@ function guestRows() {
 function renderDesk() {
   app.dirty = false;
   const mc = mailCounts();
-  $('#dk-mode').textContent = `${app.mode.toUpperCase()} · ${app.feed.length} checked in · ${creditsLeft()} credits left${app.persist ? '' : app.mode === 'demo' ? ' · not saved' : ' · local storage'}${app.server && app.mode !== 'demo' ? (app.email && app.email.enabled ? ` · ✉ ${mc.sent} sent${mc.failed ? `, ${mc.failed} failed` : ''}${app.email.dryRun ? ' (dry run)' : ''}` : ' · ✉ off') : ''}`;
+  $('#dk-mode').textContent = `${app.mode.toUpperCase()} · ${app.feed.length} checked in · ${creditsLeft()} credits left${app.poll && app.poll.mode ? ` · poll ${app.poll.mode}` : ''}${app.persist ? '' : app.mode === 'demo' ? ' · not saved' : ' · local storage'}${app.server && app.mode !== 'demo' ? (app.email && app.email.enabled ? ` · ✉ ${mc.sent} sent${mc.failed ? `, ${mc.failed} failed` : ''}${app.email.dryRun ? ' (dry run)' : ''}` : ' · ✉ off') : ''}`;
   const list = guestRows();
   deskList.innerHTML = list.slice(0, 300).map(g => `<div class="g-row${g.key === selectedKey ? ' sel' : ''}" data-key="${esc(g.key)}">
       <div><div class="g-name">${esc(g.name || g.email || 'Guest')}</div><div class="g-email">${esc(g.email || '')}</div></div>
@@ -1063,7 +1065,14 @@ async function settingsModal() {
     ${app.persist ? `<div class="field"><label>add referral codes (shared across events · ${rem.total} remaining)</label>
       <textarea id="sf-codes" rows="4" placeholder="Paste codes, one per line, or CSV: code,url&#10;CODE-001&#10;CODE-002,https://cursor.com/referral?code=CODE-002" style="width:100%;font:12px Menlo,monospace;background:#0c0d10;color:#e8eaef;border:1px solid #2a2d36;padding:8px;resize:vertical"></textarea>
       <div class="row" style="margin-top:8px"><select id="sf-code-pool"><option value="A">add to pool A</option><option value="B">add to pool B</option></select><button type="button" id="sf-add-codes">add codes</button><span class="hint" style="margin:0;align-self:center">dupes against the global pool are skipped</span></div></div>` : ''}
-    <div class="field"><label>poll interval (seconds)</label><input name="poll" type="number" min="2" max="60" value="${Math.round(app.config.pollMs / 1000)}"></div>
+    <div class="field"><label>luma polling</label>
+      <div class="dk-empty" style="margin-bottom:8px">mode now: <b>${esc((app.poll && app.poll.mode) || '—')}</b>${app.poll && app.poll.nextMs ? ` · next interval ${app.poll.nextMs >= 60000 ? Math.round(app.poll.nextMs / 60000) + ' min' : Math.round(app.poll.nextMs / 1000) + 's'}` : ''}. fast only during the event window (1h before → 2h after, configurable); outside that the webhook is primary with a slow fallback.</div>
+      <div class="row" style="margin:0 0 8px;gap:12px;flex-wrap:wrap">
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:#8a8f9a">fast (live) sec<input name="poll" type="number" min="2" max="60" value="${Math.round((app.config.pollMs || 5000) / 1000)}" style="width:88px"></label>
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:#8a8f9a">idle fallback min<input name="idlePollMin" type="number" min="1" max="120" value="${Math.round((app.config.idlePollMs || 900000) / 60000)}" style="width:88px"></label>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input name="forceFastPoll" type="checkbox"${app.config.forceFastPoll ? ' checked' : ''}> force fast polling now</label>
+    </div>
     <div class="field"><label>cell height px (text size, reloads)</label><input name="cell" type="number" min="12" max="40" value="${G.ch}"></div>
     <div class="row"><button class="primary" type="submit">save</button><button type="button" id="sf-cancel">cancel</button><span class="dk-spacer"></span><button type="button" class="danger" id="sf-reset">reset this event</button></div>
     <div class="hint">pools: A = ${esc(app.labels.A)} (${app.poolTotals.A}, ${rem.A} left) · B = ${esc(app.labels.B)} (${app.poolTotals.B}, ${rem.B} left). codes are shared across events. state is ${app.persist ? 'on the server (Supabase or data/state.json)' : app.mode === 'demo' ? 'not saved (demo)' : 'stored in this browser only'}.</div></form>`);
@@ -1100,7 +1109,12 @@ async function settingsModal() {
   };
   $('#sf').onsubmit = async e => {
     e.preventDefault(); const fd = new FormData(e.target);
-    const patch = { poolMode: String(fd.get('poolMode')), pollMs: clamp(Number(fd.get('poll')) || 5, 2, 60) * 1000 };
+    const patch = {
+      poolMode: String(fd.get('poolMode')),
+      pollMs: clamp(Number(fd.get('poll')) || 5, 2, 60) * 1000,
+      idlePollMs: clamp(Number(fd.get('idlePollMin')) || 15, 1, 120) * 60_000,
+      forceFastPoll: fd.get('forceFastPoll') === 'on',
+    };
     if (app.luma) {
       patch.eventId = String(fd.get('eventId') || '') || null;
       const sel = e.target.querySelector('select[name="eventId"]');
@@ -1143,7 +1157,7 @@ async function boot() {
     try { const r = await api('/health', { cache: 'no-store' }); if (r.status === 401) { showErr('Wall is locked — open it with ?key=… in the URL.'); return; } h = await r.json(); break; }
     catch { if (location.protocol === 'file:' || params.has('demo') || attempt >= 60) break; app.error = 'connecting to server…'; await new Promise(r => setTimeout(r, 3000)); }
   }
-  if (h) { app.server = !!h.ok; app.luma = !!h.luma; applyPoolStats(h.pools); app.email = h.email || null; app.serverPolls = !!h.serverPolls; app.headline = h.eventName || ''; if (h.eventId) app.eventId = h.eventId; if (h.eventName) app.eventName = h.eventName; app.error = ''; }
+  if (h) { app.server = !!h.ok; app.luma = !!h.luma; applyPoolStats(h.pools); app.email = h.email || null; app.serverPolls = !!h.serverPolls; app.headline = h.eventName || ''; if (h.eventId) app.eventId = h.eventId; if (h.eventName) app.eventName = h.eventName; if (h.poll) app.poll = h.poll; app.error = ''; }
   else app.server = false;
   const demo = params.has('demo') || (!app.server && !params.has('manual')) || (app.server && !app.luma && !params.has('manual'));
   app.persist = app.server && !demo;

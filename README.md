@@ -42,12 +42,13 @@ every guest email to you. **Leave `EMAIL_TEST_TO` empty on event day.** Restart 
 
 ## Deploy on a free host + switch events
 
-Aimed at Render / Koyeb / similar: no persistent disk, may sleep when idle, outbound SMTP
-often blocked.
+Aimed at Render / Koyeb / similar: no persistent disk, sleeps after ~15 min without
+inbound traffic, and may flag free services that make an uncommonly high volume of
+outbound requests. Supabase free-tier projects pause after about a week of low DB activity.
 
 1. Create a Supabase project and run the SQL below once.
 2. Deploy this repo as a Node web service. Start command: `npm start` (or
-   `node build.mjs && node serve.mjs`). Set `PORT` is honored automatically.
+   `node build.mjs && node serve.mjs`). `PORT` is honored automatically.
 3. Env vars to set on the host:
    - `PUBLIC_URL=https://wall.cursorpakistan.com` (or your domain)
    - `WALL_TOKEN`, `LUMA_API_KEY`, optional `LUMA_EVENT_ID`
@@ -55,8 +56,13 @@ often blocked.
    - `RESEND_API_KEY` + `EMAIL_FROM=Grok Bot <hello@yourdomain.com>` (or Mailgun)
    - `CODES_JSON` = minified seed JSON (or import legacy data first — see below)
    - Keep `EMAIL_TEST_TO` blank; `EMAIL_DRY_RUN=0`
-4. Point an uptime pinger at `https://wall.cursorpakistan.com/healthz` (no key required)
-   so the free instance stays awake through the meetup.
+   - Optional poll tuning: `POLL_MS` (live, default 5000), `IDLE_POLL_MS` (default 900000 =
+     15 min), `LIVE_BEFORE_MIN` / `LIVE_AFTER_MIN` (default 60 / 120)
+4. Point an uptime pinger at `https://wall.cursorpakistan.com/healthz` every ~5 minutes
+   (no key required). That single request (a) keeps the Render free instance awake and
+   (b) does one trivial Supabase `select id` so the free DB project stays active. The
+   response is only `{ok:true}` — no state is leaked. If Supabase is configured but
+   unreachable, `/healthz` returns `503 {ok:false}`.
 5. Open `https://wall.cursorpakistan.com/?key=<WALL_TOKEN>&desk`, press `D` → **settings**,
    pick the Luma event from the dropdown, Save. The choice is stored in Supabase and
    survives sleeps / redeploys. To run the next meetup: pick the new event — the wall and
@@ -64,6 +70,20 @@ often blocked.
    switching back. The same person at a new event gets a new code.
 6. To top up codes mid-season: settings → paste a list or CSV → **add codes**. Remaining
    count is shown in the desk header and settings.
+
+### Luma polling (keeps outbound volume low)
+
+The wall does **not** hit Luma every 5 s around the clock (that would look like high
+outbound volume on Render free and is unnecessary between meetups):
+
+| Mode | When | Interval |
+|---|---|---|
+| **live** | from `LIVE_BEFORE_MIN` before the event start until `LIVE_AFTER_MIN` after end | `POLL_MS` (~5 s) |
+| **idle** | outside that window | `IDLE_POLL_MS` (~15 min) + Luma webhook |
+| **force-fast** | staff checkbox in settings | same as live |
+
+Webhooks still nudge an immediate poll at any time. Staff can turn on **force fast
+polling now** from the desk if doors open early or Luma times look wrong.
 
 ### Importing a legacy `state.json` (one-off)
 
@@ -96,8 +116,8 @@ For a public https hostname without opening ports, use a Cloudflare named tunnel
 `cloudflared tunnel route dns grokbot grokbot.example.com`, copy the credentials JSON into
 `cloudflared/` next to a `config.yml` made from `config.example.yml`, set `PUBLIC_URL`, and
 run `docker compose --profile tunnel up -d`. With `PUBLIC_URL` set the server registers a
-Luma `guest.updated` webhook for itself (check-ins then show in about a second; polling
-every 5 s is the fallback). `deploy.sh` wraps the compose commands.
+Luma `guest.updated` webhook for itself (check-ins then show in about a second; outside
+the live window the slow fallback poll is the backup). `deploy.sh` wraps the compose commands.
 
 `WALL_TOKEN` gates every route except `/healthz`, the webhook, and `/assets`.
 
@@ -105,8 +125,8 @@ every 5 s is the fallback). `deploy.sh` wraps the compose commands.
 
 Open the wall with `&desk` in the URL and press `D`: search guests, see a guest's code and
 QR, resend their email, release a code back to the pool, do a manual check-in for walk-ins,
-export a CSV, change settings (event, pool mode, poll interval), **add codes**, reset the
-**current** event's allocations only.
+export a CSV, change settings (event, pool mode, live/idle poll, **force fast poll**),
+**add codes**, reset the **current** event's allocations only.
 
 ## Choosing an email transport
 
@@ -183,7 +203,11 @@ The `data` jsonb document is versioned by the app (`version: 2`). Shape:
 ```json
 {
   "version": 2,
-  "config": { "eventId": "evt-…", "eventName": "…", "poolMode": "A-then-B", "pollMs": 5000 },
+  "config": {
+    "eventId": "evt-…", "eventName": "…", "eventStart": "…", "eventEnd": "…",
+    "poolMode": "A-then-B", "pollMs": 5000, "idlePollMs": 900000,
+    "liveBeforeMs": 3600000, "liveAfterMs": 7200000, "forceFastPoll": false
+  },
   "codes": { "A": [{ "code": "…", "url": "…" }], "B": [], "labels": { "A": "Pool A", "B": "Pool B" } },
   "allocations": [
     { "key": "guest@email", "eventId": "evt-…", "name": "…", "email": "…", "codes": […], "mail": { "status": "sent" } }
