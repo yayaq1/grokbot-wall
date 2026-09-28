@@ -275,3 +275,12 @@ $$;
 
 -- Intentionally no CREATE POLICY on any of these tables.
 -- Without policies, anon/authenticated are denied; service_role bypasses RLS.
+
+-- PostgREST exposes EXECUTE on public functions to anon/authenticated by default.
+-- Lock the RPCs down to service_role only (idempotent; safe if already applied).
+revoke execute on function public.grokbot_wall_allocation_json(uuid) from public, anon, authenticated;
+revoke execute on function public.grokbot_wall_allocate(text, text, text, text, timestamptz, text, text, text, text) from public, anon, authenticated;
+revoke execute on function public.grokbot_wall_release(text, text) from public, anon, authenticated;
+grant execute on function public.grokbot_wall_allocation_json(uuid) to service_role;
+grant execute on function public.grokbot_wall_allocate(text, text, text, text, timestamptz, text, text, text, text) to service_role;
+grant execute on function public.grokbot_wall_release(text, text) to service_role;
