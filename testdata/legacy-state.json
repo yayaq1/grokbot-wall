@@ -1,0 +1,41 @@
+{
+  "allocations": [
+    {
+      "key": "alice@example.com",
+      "name": "Alice Khan",
+      "email": "alice@example.com",
+      "checkedInAt": "2026-08-01T14:00:00.000Z",
+      "source": "luma",
+      "at": "2026-08-01T14:00:01.000Z",
+      "codes": [
+        { "pool": "A", "code": "LEGACY-001", "url": "https://cursor.com/referral?code=LEGACY-001", "n": 1 }
+      ],
+      "mail": { "status": "sent", "to": "alice@example.com", "at": "2026-08-01T14:00:02.000Z", "id": "msg_1" }
+    },
+    {
+      "key": "bob@example.com",
+      "name": "Bob Ali",
+      "email": "bob@example.com",
+      "checkedInAt": "2026-08-01T14:05:00.000Z",
+      "source": "luma",
+      "at": "2026-08-01T14:05:01.000Z",
+      "codes": [
+        { "pool": "A", "code": "LEGACY-002", "url": "https://cursor.com/referral?code=LEGACY-002", "n": 2 }
+      ],
+      "mail": { "status": "sent", "to": "bob@example.com", "at": "2026-08-01T14:05:02.000Z" }
+    },
+    {
+      "key": "cara@example.com",
+      "name": "Cara",
+      "email": "cara@example.com",
+      "checkedInAt": "2026-08-01T14:10:00.000Z",
+      "source": "manual",
+      "at": "2026-08-01T14:10:01.000Z",
+      "codes": [
+        { "pool": "A", "code": "LEGACY-003", "url": "https://cursor.com/referral?code=LEGACY-003", "n": 3 }
+      ],
+      "mail": { "status": "failed", "to": "cara@example.com", "at": "2026-08-01T14:10:02.000Z", "error": "550 bounce", "tries": 1 }
+    }
+  ],
+  "config": { "eventId": null, "poolMode": "A-then-B", "pollMs": 5000 }
+}

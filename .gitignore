@@ -9,3 +9,4 @@ cloudflared/config.yml
 data/codes.json
 .idea/
 data/CODES_JSON.txt
+testdata/imported-state.json
